@@ -1,0 +1,11 @@
+services:
+  db:
+    image: mariadb:11
+    environment:
+      - MYSQL_DATABASE=shop
+      - MYSQL_USER=app
+      - MYSQL_PASSWORD=secret
+    ports:
+      - "127.0.0.1:3307:3306"
+  ignored:
+    image: redis:7

@@ -69,6 +69,22 @@ If a password is missing (or auth failed), lazydbm prompts for it. You can save 
 
 `~/.config/lazydbm/config.yaml` stores connection metadata and last-used selection only.
 
+## Test
+
+Go 1.24+ on PATH is enough. Nothing else to install for unit tests (they fake `psql`/`mysql` and the OS keychain).
+
+```bash
+./scripts/test.sh
+```
+
+Or:
+
+```bash
+go test ./... -count=1 -cover
+```
+
+Live import/export still needs the official DB clients on the machine (`psql`, `pg_dump`, `mysql`, `mysqldump`). Those are not required to run the test script.
+
 ## Releases
 
 Push a tag to publish binaries with GoReleaser:

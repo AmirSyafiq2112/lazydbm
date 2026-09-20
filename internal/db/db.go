@@ -17,6 +17,12 @@ import (
 
 type LogFunc func(string)
 
+// Test hooks. Production uses exec.LookPath and run; tests replace these.
+var (
+	lookPath      = exec.LookPath
+	commandRunner = run
+)
+
 func IsCustomDump(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
@@ -27,7 +33,7 @@ func IsCustomDump(path string) bool {
 	}
 }
 
-func MissingTools(c config.Connection, importFile string, clear, exporting bool) []string {
+func requiredBins(c config.Connection, importFile string, clear, exporting bool) []string {
 	need := map[string]struct{}{}
 	switch c.Engine {
 	case config.EnginePostgres:
@@ -50,13 +56,21 @@ func MissingTools(c config.Connection, importFile string, clear, exporting bool)
 			need["mysql"] = struct{}{}
 		}
 	}
-	var missing []string
+	out := make([]string, 0, len(need))
 	for bin := range need {
-		if _, err := exec.LookPath(bin); err != nil {
+		out = append(out, bin)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func MissingTools(c config.Connection, importFile string, clear, exporting bool) []string {
+	var missing []string
+	for _, bin := range requiredBins(c, importFile, clear, exporting) {
+		if _, err := lookPath(bin); err != nil {
 			missing = append(missing, bin)
 		}
 	}
-	sort.Strings(missing)
 	return missing
 }
 
@@ -83,16 +97,16 @@ func Import(ctx context.Context, c config.Connection, password, file string, cle
 	switch c.Engine {
 	case config.EnginePostgres:
 		if IsCustomDump(file) {
-			return run(ctx, password, log, "pg_restore", append(pgConnArgs(c, c.Database), "--no-owner", "--no-acl", "--verbose", file), nil)
+			return commandRunner(ctx, password, log, "pg_restore", append(pgConnArgs(c, c.Database), "--no-owner", "--no-acl", "--verbose", file), nil)
 		}
-		return run(ctx, password, log, "psql", append(psqlArgs(c, c.Database), "-f", file), nil)
+		return commandRunner(ctx, password, log, "psql", append(psqlArgs(c, c.Database), "-f", file), nil)
 	case config.EngineMySQL:
 		f, err := os.Open(file)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		return run(ctx, password, log, "mysql", mysqlArgs(c, c.Database), f)
+		return commandRunner(ctx, password, log, "mysql", mysqlArgs(c, c.Database), f)
 	default:
 		return fmt.Errorf("unsupported engine %s", c.Engine)
 	}
@@ -122,28 +136,34 @@ func Export(ctx context.Context, c config.Connection, password, out string, log 
 
 	switch c.Engine {
 	case config.EnginePostgres:
-		return run(ctx, password, log, "pg_dump", append(pgConnArgs(c, c.Database), "--no-owner", "--no-acl"), f)
+		return commandRunner(ctx, password, log, "pg_dump", append(pgConnArgs(c, c.Database), "--no-owner", "--no-acl"), f)
 	case config.EngineMySQL:
-		return run(ctx, password, log, "mysqldump", append(mysqlArgs(c, c.Database), "--single-transaction", "--routines", "--triggers"), f)
+		return commandRunner(ctx, password, log, "mysqldump", append(mysqlArgs(c, c.Database), "--single-transaction", "--routines", "--triggers"), f)
 	default:
 		return fmt.Errorf("unsupported engine %s", c.Engine)
 	}
 }
 
+func postgresResetSQL(c config.Connection) string {
+	return strings.Join([]string{
+		fmt.Sprintf("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid();", quoteLiteral(c.Database)),
+		fmt.Sprintf("DROP DATABASE IF EXISTS %s;", quoteIdent(c.Database)),
+		fmt.Sprintf("CREATE DATABASE %s OWNER %s;", quoteIdent(c.Database), quoteIdent(c.User)),
+	}, "\n")
+}
+
+func mysqlResetSQL(c config.Connection) string {
+	return fmt.Sprintf("DROP DATABASE IF EXISTS %s; CREATE DATABASE %s;", quoteMySQL(c.Database), quoteMySQL(c.Database))
+}
+
 func reset(ctx context.Context, c config.Connection, password string, log LogFunc) error {
 	switch c.Engine {
 	case config.EnginePostgres:
-		sql := strings.Join([]string{
-			fmt.Sprintf("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid();", quoteLiteral(c.Database)),
-			fmt.Sprintf("DROP DATABASE IF EXISTS %s;", quoteIdent(c.Database)),
-			fmt.Sprintf("CREATE DATABASE %s OWNER %s;", quoteIdent(c.Database), quoteIdent(c.User)),
-		}, "\n")
 		log("reset via maintenance database postgres")
-		return run(ctx, password, log, "psql", psqlArgs(c, "postgres"), strings.NewReader(sql))
+		return commandRunner(ctx, password, log, "psql", psqlArgs(c, "postgres"), strings.NewReader(postgresResetSQL(c)))
 	case config.EngineMySQL:
-		sql := fmt.Sprintf("DROP DATABASE IF EXISTS %s; CREATE DATABASE %s;", quoteMySQL(c.Database), quoteMySQL(c.Database))
 		log("reset via server connection")
-		return run(ctx, password, log, "mysql", mysqlArgs(c, ""), strings.NewReader(sql))
+		return commandRunner(ctx, password, log, "mysql", mysqlArgs(c, ""), strings.NewReader(mysqlResetSQL(c)))
 	default:
 		return fmt.Errorf("unsupported engine %s", c.Engine)
 	}

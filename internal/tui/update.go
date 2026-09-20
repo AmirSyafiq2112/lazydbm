@@ -13,6 +13,18 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+var (
+	importDB = db.Import
+	exportDB = db.Export
+)
+
+func (m model) storeOrDefault() secret.Store {
+	if m.store != nil {
+		return m.store
+	}
+	return secret.Default
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -215,7 +227,7 @@ func (m model) savePassword(persist bool) (tea.Model, tea.Cmd) {
 	pw := m.pwInput.Value()
 	m.memPW[c.ID()] = pw
 	if persist {
-		if err := secret.Set(c.ID(), pw); err != nil {
+		if err := m.storeOrDefault().Set(c.ID(), pw); err != nil {
 			return m.showNotice("keychain save failed: " + err.Error() + " (using this session only)")
 		}
 		m.hasKey[c.ID()] = true
@@ -284,7 +296,7 @@ func (m model) startImportJob() (model, tea.Cmd) {
 		if !filepath.IsAbs(path) {
 			path = exportAbs(cwd, rel)
 		}
-		return db.Import(ctx, c, pw, path, clear, log)
+		return importDB(ctx, c, pw, path, clear, log)
 	})
 	return m, nil
 }
@@ -303,7 +315,7 @@ func (m model) startExportJob(path string) (model, tea.Cmd) {
 	m.stickLog = true
 	out := exportAbs(cwd, path)
 	m.runner.Start("export "+c.Database+" -> "+path, func(ctx context.Context, log func(string)) error {
-		return db.Export(ctx, c, pw, out, log)
+		return exportDB(ctx, c, pw, out, log)
 	})
 	return m, nil
 }

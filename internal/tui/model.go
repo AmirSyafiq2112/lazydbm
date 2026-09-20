@@ -61,6 +61,9 @@ type model struct {
 	notice    string
 	pwInput   textinput.Model
 	pathInput textinput.Model
+
+	store   secret.Store
+	saveCfg func(config.File) error
 }
 
 func Run(cwd, version string) error {
@@ -95,6 +98,8 @@ func newModel(cwd, version string) model {
 		pwInput:   pw,
 		pathInput: path,
 		logVP:     viewport.New(20, 10),
+		store:     secret.Default,
+		saveCfg:   config.Save,
 	}
 }
 
@@ -119,22 +124,29 @@ type discoveredMsg struct {
 
 func reload(cwd string) tea.Cmd {
 	return func() tea.Msg {
-		cfg, err := config.Load()
-		if err != nil {
-			return discoveredMsg{err: fmt.Errorf("config: %w", err)}
-		}
-		res, err := discover.Scan(cwd, cfg.Connections)
-		if err != nil {
-			return discoveredMsg{cfg: cfg, err: fmt.Errorf("discover: %w", err)}
-		}
-		keys := map[string]bool{}
-		for _, c := range res.Connections {
-			if pw, err := secret.Get(c.ID()); err == nil && pw != "" {
-				keys[c.ID()] = true
-			}
-		}
-		return discoveredMsg{cfg: cfg, res: res, keys: keys}
+		return loadDiscovered(cwd, secret.Default)
 	}
+}
+
+func loadDiscovered(cwd string, st secret.Store) discoveredMsg {
+	if st == nil {
+		st = secret.Default
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return discoveredMsg{err: fmt.Errorf("config: %w", err)}
+	}
+	res, err := discover.Scan(cwd, cfg.Connections)
+	if err != nil {
+		return discoveredMsg{cfg: cfg, err: fmt.Errorf("discover: %w", err)}
+	}
+	keys := map[string]bool{}
+	for _, c := range res.Connections {
+		if pw, err := st.Get(c.ID()); err == nil && pw != "" {
+			keys[c.ID()] = true
+		}
+	}
+	return discoveredMsg{cfg: cfg, res: res, keys: keys}
 }
 
 func (m model) currentConn() (config.Connection, bool) {
@@ -160,7 +172,11 @@ func (m model) passwordFor(c config.Connection) (string, string) {
 		return pw, "env"
 	}
 	if m.hasKey[id] {
-		if pw, err := secret.Get(id); err == nil && pw != "" {
+		st := m.store
+		if st == nil {
+			st = secret.Default
+		}
+		if pw, err := st.Get(id); err == nil && pw != "" {
 			return pw, "key"
 		}
 	}
@@ -170,12 +186,18 @@ func (m model) passwordFor(c config.Connection) (string, string) {
 func (m model) persistLastUsed(c config.Connection) model {
 	m.cfg.LastUsed = c.ID()
 	m.cfg.Upsert(c)
-	_ = config.Save(m.cfg)
+	save := m.saveCfg
+	if save == nil {
+		save = config.Save
+	}
+	_ = save(m.cfg)
 	return m
 }
 
+var now = time.Now
+
 func defaultExportPath(c config.Connection) string {
-	return fmt.Sprintf("%s-%s.sql", c.Database, time.Now().Format("20060102-150405"))
+	return fmt.Sprintf("%s-%s.sql", c.Database, now().Format("20060102-150405"))
 }
 
 func exportAbs(cwd, path string) string {
