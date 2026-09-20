@@ -101,12 +101,13 @@ func serviceConnection(svcName string, svc composeService, source string) (confi
 				pw = rootPW
 			}
 		}
-		if c.Database == "" {
-			return config.Connection{}, "", false
-		}
 	}
-	c.Name = c.Database + " (" + svcName + ")"
-	if !c.Valid() {
+	if c.Database != "" {
+		c.Name = c.Database + " (" + svcName + ")"
+	} else {
+		c.Name = svcName
+	}
+	if !c.ValidServer() {
 		return config.Connection{}, "", false
 	}
 	return c, pw, true

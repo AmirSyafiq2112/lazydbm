@@ -33,8 +33,9 @@ type recorded struct {
 }
 
 type recorder struct {
-	calls []recorded
-	err   error
+	calls  []recorded
+	err    error
+	output []string
 }
 
 func (r *recorder) run(_ context.Context, _ string, log LogFunc, name string, args []string, stdin io.Reader) error {
@@ -45,6 +46,9 @@ func (r *recorder) run(_ context.Context, _ string, log LogFunc, name string, ar
 	r.calls = append(r.calls, recorded{name: name, args: append([]string{}, args...), stdin: string(body)})
 	if log != nil {
 		log("$ " + name + " " + strings.Join(args, " "))
+		for _, line := range r.output {
+			log(line)
+		}
 	}
 	return r.err
 }
@@ -99,7 +103,7 @@ func TestRequiredBins(t *testing.T) {
 	if got := strings.Join(requiredBins(c, "a.sql", false, false), ","); got != "psql" {
 		t.Fatalf("import sql = %s", got)
 	}
-	if got := strings.Join(requiredBins(c, "a.dump", false, false), ","); got != "pg_restore" {
+	if got := strings.Join(requiredBins(c, "a.dump", false, false), ","); got != "pg_restore,psql" {
 		t.Fatalf("import dump = %s", got)
 	}
 	if got := strings.Join(requiredBins(c, "a.dump", true, false), ","); got != "pg_restore,psql" {
@@ -152,6 +156,61 @@ func TestMysqlArgsNoPasswordFlag(t *testing.T) {
 	}
 	if mysqlArgs(c, "")[len(mysqlArgs(c, ""))-1] == "shop" {
 		t.Fatal("empty database should omit db name")
+	}
+	args = mysqlArgs(c, "shop")
+	if !contains(args, "--") || args[len(args)-1] != "shop" || args[len(args)-2] != "--" {
+		t.Fatalf("database must follow -- : %v", args)
+	}
+}
+
+func TestSafeCLIFileArg(t *testing.T) {
+	if got := safeCLIFileArg("-f.sql"); got != "./-f.sql" {
+		t.Fatalf("got %q", got)
+	}
+	if got := safeCLIFileArg("./-f.sql"); got != "./-f.sql" {
+		t.Fatalf("got %q", got)
+	}
+	if got := safeCLIFileArg("dump.sql"); got != "dump.sql" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func writeTempSQL(t *testing.T, name, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestImportDashFilename(t *testing.T) {
+	rec := withFakeExec(t, nil)
+	sql := writeTempSQL(t, "-f.sql", "SELECT 1;\nALTER TABLE t OWNER TO epbt_app;\n")
+	if err := Import(context.Background(), pgConn(), "", sql, false, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	args := rec.calls[len(rec.calls)-1].args
+	if contains(args, "-f") || contains(args, "-f.sql") || contains(args, sql) {
+		t.Fatalf("sql import must use stdin, not -f: %v", args)
+	}
+	if strings.Contains(rec.calls[len(rec.calls)-1].stdin, "OWNER TO") {
+		t.Fatalf("owners should be stripped: %q", rec.calls[len(rec.calls)-1].stdin)
+	}
+	if !strings.Contains(rec.calls[len(rec.calls)-1].stdin, "SELECT 1") {
+		t.Fatalf("sql body missing: %q", rec.calls[len(rec.calls)-1].stdin)
+	}
+
+	rec = withFakeExec(t, nil)
+	if err := Import(context.Background(), pgConn(), "", "-x.dump", false, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	args = rec.calls[len(rec.calls)-1].args
+	if contains(args, "-x.dump") {
+		t.Fatalf("raw dump name: %v", args)
+	}
+	if !contains(args, "./-x.dump") || !contains(args, "--") {
+		t.Fatalf("pg_restore args = %v", args)
 	}
 }
 
@@ -208,6 +267,82 @@ func TestResetSQL(t *testing.T) {
 	}
 }
 
+func TestEnsureDatabaseCreatesWhenMissing(t *testing.T) {
+	rec := withFakeExec(t, nil)
+	var logs []string
+	if err := EnsureDatabase(context.Background(), pgConn(), "", func(s string) { logs = append(logs, s) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 2 {
+		t.Fatalf("calls = %#v", rec.calls)
+	}
+	if !strings.Contains(rec.calls[0].args[len(rec.calls[0].args)-1], "pg_database") {
+		t.Fatalf("exists query = %v", rec.calls[0].args)
+	}
+	if !strings.Contains(rec.calls[1].stdin, `CREATE DATABASE "epbt"`) {
+		t.Fatalf("create stdin = %s", rec.calls[1].stdin)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "creating database epbt") {
+		t.Fatalf("logs = %s", joined)
+	}
+
+	rec = withFakeExec(t, nil)
+	if err := EnsureDatabase(context.Background(), myConn(), "", func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.calls[len(rec.calls)-1].stdin, "CREATE DATABASE IF NOT EXISTS `shop`") {
+		t.Fatalf("mysql create = %#v", rec.calls)
+	}
+}
+
+func TestEnsureDatabaseSkipsWhenExists(t *testing.T) {
+	rec := withFakeExec(t, nil)
+	rec.output = []string{"1"}
+	var logs []string
+	if err := EnsureDatabase(context.Background(), pgConn(), "", func(s string) { logs = append(logs, s) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("should not create: %#v", rec.calls)
+	}
+	if strings.Contains(rec.calls[0].stdin, "CREATE DATABASE") {
+		t.Fatalf("exists check should be a query: %#v", rec.calls[0])
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "already exists") {
+		t.Fatalf("logs = %s", strings.Join(logs, "\n"))
+	}
+}
+
+func TestImportCreatesMissingDatabase(t *testing.T) {
+	rec := withFakeExec(t, nil)
+	file := writeTempSQL(t, "dump.sql", "SELECT 1;\nALTER TABLE t OWNER TO epbt_app;\n")
+	var logs []string
+	if err := Import(context.Background(), pgConn(), "", file, false, func(s string) { logs = append(logs, s) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 3 {
+		t.Fatalf("exists + create + import, got %#v", rec.calls)
+	}
+	if !strings.Contains(rec.calls[1].stdin, `CREATE DATABASE "epbt"`) {
+		t.Fatalf("create = %s", rec.calls[1].stdin)
+	}
+	imp := rec.calls[2]
+	if contains(imp.args, "-f") {
+		t.Fatalf("sql import must use stdin: %v", imp.args)
+	}
+	if strings.Contains(imp.stdin, "OWNER TO") || !strings.Contains(imp.stdin, "SELECT 1") {
+		t.Fatalf("filtered stdin = %q", imp.stdin)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "creating database") || strings.Contains(joined, "clearing database") {
+		t.Fatalf("logs = %s", joined)
+	}
+	if !strings.Contains(joined, "owners/grants skipped") {
+		t.Fatalf("logs = %s", joined)
+	}
+}
+
 func TestImportValidation(t *testing.T) {
 	ctx := context.Background()
 	log := func(string) {}
@@ -224,8 +359,9 @@ func TestImportValidation(t *testing.T) {
 
 func TestImportPostgresSQLAndClear(t *testing.T) {
 	rec := withFakeExec(t, nil)
+	file := writeTempSQL(t, "dump.sql", "SELECT 1;\nGRANT ALL ON SCHEMA public TO epbt_app;\n")
 	var logs []string
-	err := Import(context.Background(), pgConn(), "secret", "dump.sql", true, func(s string) { logs = append(logs, s) })
+	err := Import(context.Background(), pgConn(), "secret", file, true, func(s string) { logs = append(logs, s) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,11 +374,17 @@ func TestImportPostgresSQLAndClear(t *testing.T) {
 	if !strings.Contains(rec.calls[0].stdin, "DROP DATABASE") {
 		t.Fatalf("reset stdin = %s", rec.calls[0].stdin)
 	}
-	if !contains(rec.calls[1].args, "-f") || !contains(rec.calls[1].args, "dump.sql") {
-		t.Fatalf("import args = %v", rec.calls[1].args)
+	if contains(rec.calls[1].args, "-f") {
+		t.Fatalf("sql import must use stdin: %v", rec.calls[1].args)
+	}
+	if strings.Contains(rec.calls[1].stdin, "GRANT ALL") || !strings.Contains(rec.calls[1].stdin, "SELECT 1") {
+		t.Fatalf("filtered stdin = %q", rec.calls[1].stdin)
 	}
 	joined := strings.Join(logs, "\n")
 	if !strings.Contains(joined, "clearing database") || strings.Contains(joined, "secret") {
+		t.Fatalf("logs = %s", joined)
+	}
+	if !strings.Contains(joined, "owners/grants skipped") {
 		t.Fatalf("logs = %s", joined)
 	}
 }
@@ -252,7 +394,8 @@ func TestImportPostgresCustomDump(t *testing.T) {
 	if err := Import(context.Background(), pgConn(), "", "db.backup", false, func(string) {}); err != nil {
 		t.Fatal(err)
 	}
-	if rec.calls[0].name != "pg_restore" || !contains(rec.calls[0].args, "db.backup") {
+	last := rec.calls[len(rec.calls)-1]
+	if last.name != "pg_restore" || !contains(last.args, "db.backup") {
 		t.Fatalf("calls = %#v", rec.calls)
 	}
 }
@@ -372,4 +515,144 @@ func contains(ss []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestListDatabasesPostgresAndMySQL(t *testing.T) {
+	origL, origR := lookPath, commandRunner
+	t.Cleanup(func() { lookPath = origL; commandRunner = origR })
+	lookPath = func(bin string) (string, error) { return "/bin/" + bin, nil }
+	var gotName string
+	var gotArgs []string
+	commandRunner = func(_ context.Context, _ string, log LogFunc, name string, args []string, _ io.Reader) error {
+		gotName, gotArgs = name, append([]string{}, args...)
+		if log != nil {
+			log("$ " + name + " " + strings.Join(args, " "))
+			log("epbt")
+			log("postgres")
+		}
+		return nil
+	}
+	names, err := ListDatabases(context.Background(), pgConn(), "pw", func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotName != "psql" || !contains(gotArgs, "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY 1;") {
+		t.Fatalf("psql args = %s %v", gotName, gotArgs)
+	}
+	if !contains(gotArgs, "postgres") {
+		t.Fatalf("must use maintenance db postgres: %v", gotArgs)
+	}
+	if strings.Join(names, ",") != "epbt,postgres" {
+		t.Fatalf("names = %v", names)
+	}
+
+	commandRunner = func(_ context.Context, _ string, log LogFunc, name string, args []string, _ io.Reader) error {
+		gotName, gotArgs = name, append([]string{}, args...)
+		if log != nil {
+			log("shop")
+			log("mysql")
+		}
+		return nil
+	}
+	names, err = ListDatabases(context.Background(), myConn(), "pw", func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotName != "mysql" || !contains(gotArgs, "SHOW DATABASES") {
+		t.Fatalf("mysql args = %s %v", gotName, gotArgs)
+	}
+	if contains(gotArgs, "shop") {
+		t.Fatalf("SHOW DATABASES must not select a database: %v", gotArgs)
+	}
+	if strings.Join(names, ",") != "mysql,shop" {
+		t.Fatalf("names = %v", names)
+	}
+
+	commandRunner = func(_ context.Context, _ string, log LogFunc, _ string, _ []string, _ io.Reader) error {
+		if log != nil {
+			log("ok")
+			log("../etc")
+			log("-bad")
+			log("a/b")
+		}
+		return nil
+	}
+	names, err = ListDatabases(context.Background(), pgConn(), "pw", func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(names, ",") != "ok" {
+		t.Fatalf("invalid names must be skipped: %v", names)
+	}
+}
+
+func TestListDatabasesMissingToolsAndValidation(t *testing.T) {
+	withFakeExec(t, map[string]bool{"psql": true})
+	if _, err := ListDatabases(context.Background(), pgConn(), "", func(string) {}); err == nil || !strings.Contains(err.Error(), "psql") {
+		t.Fatalf("err = %v", err)
+	}
+	evil := pgConn()
+	evil.User = "--evil"
+	withFakeExec(t, nil)
+	if _, err := ListDatabases(context.Background(), evil, "", func(string) {}); err == nil {
+		t.Fatal("ValidateFields must reject --evil")
+	}
+}
+
+func TestTestConnectionPostgresAndMySQL(t *testing.T) {
+	origL, origR := lookPath, commandRunner
+	t.Cleanup(func() { lookPath = origL; commandRunner = origR })
+	lookPath = func(bin string) (string, error) { return "/bin/" + bin, nil }
+	var gotName string
+	var gotArgs []string
+	commandRunner = func(_ context.Context, _ string, log LogFunc, name string, args []string, _ io.Reader) error {
+		gotName, gotArgs = name, append([]string{}, args...)
+		if log != nil {
+			log("$ " + name)
+			log("1")
+		}
+		return nil
+	}
+	if err := TestConnection(context.Background(), pgConn(), "pw", func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if gotName != "psql" || !contains(gotArgs, "SELECT 1") || !contains(gotArgs, "epbt") {
+		t.Fatalf("psql test args = %s %v", gotName, gotArgs)
+	}
+
+	commandRunner = func(_ context.Context, _ string, log LogFunc, name string, args []string, _ io.Reader) error {
+		gotName, gotArgs = name, append([]string{}, args...)
+		return nil
+	}
+	if err := TestConnection(context.Background(), myConn(), "pw", func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if gotName != "mysql" || !contains(gotArgs, "SELECT 1") {
+		t.Fatalf("mysql test args = %s %v", gotName, gotArgs)
+	}
+
+	server := myConn()
+	server.Database = ""
+	if err := TestConnection(context.Background(), server, "pw", func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if gotName != "mysql" || !contains(gotArgs, "SELECT 1") || !contains(gotArgs, "mysql") {
+		t.Fatalf("mysql maintenance db args = %s %v", gotName, gotArgs)
+	}
+
+	pgServer := pgConn()
+	pgServer.Database = ""
+	if err := TestConnection(context.Background(), pgServer, "pw", func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(gotArgs, "postgres") {
+		t.Fatalf("postgres maintenance db args = %v", gotArgs)
+	}
+
+	commandRunner = func(_ context.Context, _ string, _ LogFunc, _ string, _ []string, _ io.Reader) error {
+		return errors.New("connection refused")
+	}
+	if err := TestConnection(context.Background(), pgConn(), "pw", func(string) {}); err == nil || !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("err = %v", err)
+	}
 }

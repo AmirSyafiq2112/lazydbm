@@ -16,28 +16,39 @@ func Scan(cwd string, saved []config.Connection) (Result, error) {
 	res := Result{EnvPasswords: map[string]string{}}
 	seen := map[string]int{}
 
-	add := func(c config.Connection, password string) {
-		if !c.Valid() {
+	add := func(c config.Connection, password string, recordPW bool) {
+		if !c.ValidServer() {
 			return
 		}
 		id := c.ID()
 		if idx, ok := seen[id]; ok {
-			if password != "" {
-				res.EnvPasswords[id] = password
+			if recordPW {
+				if _, exists := res.EnvPasswords[id]; !exists || password != "" {
+					res.EnvPasswords[id] = password
+				}
 			}
 			if c.Name != "" && res.Connections[idx].Name == "" {
 				res.Connections[idx].Name = c.Name
+			}
+			if res.Connections[idx].Database == "" && c.Database != "" {
+				res.Connections[idx].Database = c.Database
+			}
+			if res.Connections[idx].LastDatabase == "" && c.LastDatabase != "" {
+				res.Connections[idx].LastDatabase = c.LastDatabase
+			}
+			if c.NoPassword {
+				res.Connections[idx].NoPassword = true
 			}
 			return
 		}
 		seen[id] = len(res.Connections)
 		res.Connections = append(res.Connections, c)
-		if password != "" {
+		if recordPW {
 			res.EnvPasswords[id] = password
 		}
 	}
 
-	envConns, envPWs, err := fromEnvFiles(cwd)
+	envConns, envPWs, envHasPW, err := fromEnvFiles(cwd)
 	if err != nil {
 		return Result{}, err
 	}
@@ -56,21 +67,17 @@ func Scan(cwd string, saved []config.Connection) (Result, error) {
 				c.Source = ".env+compose"
 			}
 		}
-		add(c, envPWs[i])
+		add(c, envPWs[i], envHasPW[i])
 	}
 	for i, c := range composeConns {
-		add(c, composePWs[i])
+		add(c, composePWs[i], composePWs[i] != "")
 	}
 	for _, c := range saved {
-		add(c, "")
+		add(c, "", false)
 	}
 
 	sort.SliceStable(res.Connections, func(i, j int) bool {
-		a, b := res.Connections[i], res.Connections[j]
-		if a.Database != b.Database {
-			return a.Database < b.Database
-		}
-		return a.ID() < b.ID()
+		return res.Connections[i].ID() < res.Connections[j].ID()
 	})
 	seen = map[string]int{}
 	for i, c := range res.Connections {

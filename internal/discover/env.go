@@ -11,14 +11,15 @@ import (
 	"github.com/AmirSyafiq2112/lazydbm/internal/config"
 )
 
-func fromEnvFiles(cwd string) ([]config.Connection, []string, error) {
+func fromEnvFiles(cwd string) ([]config.Connection, []string, []bool, error) {
 	entries, err := os.ReadDir(cwd)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	var conns []config.Connection
 	var passwords []string
+	var hasPW []bool
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -27,7 +28,7 @@ func fromEnvFiles(cwd string) ([]config.Connection, []string, error) {
 		if !isEnvFile(name) {
 			continue
 		}
-		c, pw, ok, err := parseEnvConnection(filepath.Join(cwd, name), name)
+		c, pw, has, ok, err := parseEnvConnection(filepath.Join(cwd, name), name)
 		if err != nil {
 			continue
 		}
@@ -36,8 +37,9 @@ func fromEnvFiles(cwd string) ([]config.Connection, []string, error) {
 		}
 		conns = append(conns, c)
 		passwords = append(passwords, pw)
+		hasPW = append(hasPW, has)
 	}
-	return conns, passwords, nil
+	return conns, passwords, hasPW, nil
 }
 
 func isEnvFile(name string) bool {
@@ -54,22 +56,22 @@ func isEnvFile(name string) bool {
 	return true
 }
 
-func parseEnvConnection(path, source string) (config.Connection, string, bool, error) {
+func parseEnvConnection(path, source string) (config.Connection, string, bool, bool, error) {
 	kv, err := parseEnvFile(path)
 	if err != nil {
-		return config.Connection{}, "", false, err
+		return config.Connection{}, "", false, false, err
 	}
 
 	if raw := first(kv, "DATABASE_URL", "DB_URL"); raw != "" {
-		c, pw, ok := parseDatabaseURL(raw, source)
+		c, pw, hasPW, ok := parseDatabaseURL(raw, source)
 		if ok {
-			return c, pw, true, nil
+			return c, pw, hasPW, true, nil
 		}
 	}
 
 	engine, ok := config.NormalizeEngine(first(kv, "DB_CONNECTION", "DB_DRIVER"))
 	if !ok {
-		return config.Connection{}, "", false, nil
+		return config.Connection{}, "", false, false, nil
 	}
 
 	c := config.Connection{
@@ -89,22 +91,27 @@ func parseEnvConnection(path, source string) (config.Connection, string, bool, e
 		}
 	}
 	if c.Name == "" {
-		c.Name = c.Database + " (" + source + ")"
+		if c.Database != "" {
+			c.Name = c.Database + " (" + source + ")"
+		} else {
+			c.Name = source
+		}
 	}
-	if !c.Valid() {
-		return config.Connection{}, "", false, nil
+	if !c.ValidServer() {
+		return config.Connection{}, "", false, false, nil
 	}
-	return c, first(kv, "DB_PASSWORD", "DB_PASS"), true, nil
+	pw, hasPW := lookup(kv, "DB_PASSWORD", "DB_PASS")
+	return c, pw, hasPW, true, nil
 }
 
-func parseDatabaseURL(raw, source string) (config.Connection, string, bool) {
+func parseDatabaseURL(raw, source string) (config.Connection, string, bool, bool) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return config.Connection{}, "", false
+		return config.Connection{}, "", false, false
 	}
 	engine, ok := config.NormalizeEngine(u.Scheme)
 	if !ok {
-		return config.Connection{}, "", false
+		return config.Connection{}, "", false, false
 	}
 	port := defaultPort(engine)
 	if u.Port() != "" {
@@ -116,8 +123,13 @@ func parseDatabaseURL(raw, source string) (config.Connection, string, bool) {
 	if i := strings.IndexByte(dbName, '/'); i >= 0 {
 		dbName = dbName[:i]
 	}
-	user := u.User.Username()
-	pw, _ := u.User.Password()
+	user := ""
+	pw := ""
+	hasPW := false
+	if u.User != nil {
+		user = u.User.Username()
+		pw, hasPW = u.User.Password()
+	}
 	host := u.Hostname()
 	if host == "" {
 		host = "127.0.0.1"
@@ -132,9 +144,9 @@ func parseDatabaseURL(raw, source string) (config.Connection, string, bool) {
 		Source:   source,
 	}
 	if !c.Valid() {
-		return config.Connection{}, "", false
+		return config.Connection{}, "", false, false
 	}
-	return c, pw, true
+	return c, pw, hasPW, true
 }
 
 func parseEnvFile(path string) (map[string]string, error) {
@@ -187,6 +199,15 @@ func first(kv map[string]string, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func lookup(kv map[string]string, keys ...string) (string, bool) {
+	for _, k := range keys {
+		if v, ok := kv[k]; ok {
+			return v, true
+		}
+	}
+	return "", false
 }
 
 func defaultPort(e config.Engine) int {

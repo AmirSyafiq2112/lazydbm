@@ -97,3 +97,13 @@ func TestWaitTimeout(t *testing.T) {
 	close(block)
 	_, _ = Wait(r, 2*time.Second)
 }
+
+func TestRunnerAppend(t *testing.T) {
+	r := New()
+	r.Append("blocked: no file")
+	r.Append("")
+	lines, _, _ := r.Snapshot()
+	if len(lines) != 1 || lines[0] != "blocked: no file" {
+		t.Fatalf("%#v", lines)
+	}
+}

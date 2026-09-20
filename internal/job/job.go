@@ -102,6 +102,10 @@ func (r *Runner) Start(title string, fn func(ctx context.Context, log func(strin
 	return true
 }
 
+func (r *Runner) Append(line string) {
+	r.append(line)
+}
+
 func (r *Runner) append(line string) {
 	line = strings.TrimRight(line, "\r\n")
 	if line == "" {

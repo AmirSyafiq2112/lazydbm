@@ -42,12 +42,8 @@ func requiredBins(c config.Connection, importFile string, clear, exporting bool)
 		} else {
 			if importFile != "" && IsCustomDump(importFile) {
 				need["pg_restore"] = struct{}{}
-			} else {
-				need["psql"] = struct{}{}
 			}
-			if clear {
-				need["psql"] = struct{}{}
-			}
+			need["psql"] = struct{}{}
 		}
 	case config.EngineMySQL:
 		if exporting {
@@ -74,6 +70,113 @@ func MissingTools(c config.Connection, importFile string, clear, exporting bool)
 	return missing
 }
 
+func clientBin(c config.Connection) string {
+	if c.Engine == config.EngineMySQL {
+		return "mysql"
+	}
+	return "psql"
+}
+
+func requireCreds(c config.Connection) error {
+	probe := c
+	if probe.Database == "" {
+		if c.Engine == config.EngineMySQL {
+			probe.Database = "mysql"
+		} else {
+			probe.Database = "postgres"
+		}
+	}
+	if err := probe.ValidateFields(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func collectQuery(ctx context.Context, password string, log LogFunc, name string, args []string) ([]string, error) {
+	var out []string
+	wrap := func(s string) {
+		if log != nil {
+			log(s)
+		}
+		s = strings.TrimSpace(s)
+		if s == "" || strings.HasPrefix(s, "$ ") {
+			return
+		}
+		out = append(out, s)
+	}
+	err := commandRunner(ctx, password, wrap, name, args, nil)
+	return out, err
+}
+
+// ListDatabases returns non-template databases on the server.
+// Postgres uses the maintenance database "postgres"; MySQL uses a server-level SHOW DATABASES.
+func ListDatabases(ctx context.Context, c config.Connection, password string, log LogFunc) ([]string, error) {
+	if err := requireCreds(c); err != nil {
+		return nil, err
+	}
+	bin := clientBin(c)
+	if _, err := lookPath(bin); err != nil {
+		return nil, fmt.Errorf("missing client tools: %s", bin)
+	}
+	var args []string
+	switch c.Engine {
+	case config.EnginePostgres:
+		args = append(psqlArgs(c, "postgres"), "-X", "-w", "-tA", "-c", "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY 1;")
+	case config.EngineMySQL:
+		args = append(mysqlArgs(c, ""), "-N", "-e", "SHOW DATABASES")
+	default:
+		return nil, fmt.Errorf("unsupported engine %s", c.Engine)
+	}
+	lines, err := collectQuery(ctx, password, log, bin, args)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(lines))
+	seen := map[string]struct{}{}
+	for _, line := range lines {
+		if _, ok := seen[line]; ok {
+			continue
+		}
+		if err := config.ValidateDatabase(line); err != nil {
+			continue
+		}
+		seen[line] = struct{}{}
+		names = append(names, line)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// TestConnection runs SELECT 1 against the connection's database, or the
+// engine maintenance database when Database is empty (used while listing).
+func TestConnection(ctx context.Context, c config.Connection, password string, log LogFunc) error {
+	if err := requireCreds(c); err != nil {
+		return err
+	}
+	bin := clientBin(c)
+	if _, err := lookPath(bin); err != nil {
+		return fmt.Errorf("missing client tools: %s", bin)
+	}
+	switch c.Engine {
+	case config.EnginePostgres:
+		dbName := c.Database
+		if dbName == "" {
+			dbName = "postgres"
+		}
+		_, err := collectQuery(ctx, password, log, bin, append(psqlArgs(c, dbName), "-X", "-w", "-c", "SELECT 1"))
+		return err
+	case config.EngineMySQL:
+		dbName := c.Database
+		if dbName == "" {
+			dbName = "mysql"
+		}
+		_, err := collectQuery(ctx, password, log, bin, append(mysqlArgs(c, dbName), "-e", "SELECT 1"))
+		return err
+	default:
+		return fmt.Errorf("unsupported engine %s", c.Engine)
+	}
+}
+
 func Import(ctx context.Context, c config.Connection, password, file string, clear bool, log LogFunc) error {
 	if file == "" {
 		return fmt.Errorf("no dump file selected")
@@ -92,15 +195,25 @@ func Import(ctx context.Context, c config.Connection, password, file string, cle
 		if err := reset(ctx, c, password, log); err != nil {
 			return err
 		}
+	} else if err := EnsureDatabase(ctx, c, password, log); err != nil {
+		return err
 	}
-	log("importing " + file)
 	switch c.Engine {
 	case config.EnginePostgres:
 		if IsCustomDump(file) {
-			return commandRunner(ctx, password, log, "pg_restore", append(pgConnArgs(c, c.Database), "--no-owner", "--no-acl", "--verbose", file), nil)
+			log("importing " + file)
+			file = safeCLIFileArg(file)
+			return commandRunner(ctx, password, log, "pg_restore", append(pgConnArgs(c, c.Database), "--no-owner", "--no-acl", "--verbose", "--", file), nil)
 		}
-		return commandRunner(ctx, password, log, "psql", append(psqlArgs(c, c.Database), "-f", file), nil)
+		f, err := os.Open(file)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		log("importing " + file + " (owners/grants skipped)")
+		return commandRunner(ctx, password, log, "psql", psqlArgs(c, c.Database), filterPostgresSQL(f))
 	case config.EngineMySQL:
+		log("importing " + file)
 		f, err := os.Open(file)
 		if err != nil {
 			return err
@@ -169,6 +282,84 @@ func reset(ctx context.Context, c config.Connection, password string, log LogFun
 	}
 }
 
+func postgresCreateSQL(c config.Connection) string {
+	return fmt.Sprintf("CREATE DATABASE %s OWNER %s;", quoteIdent(c.Database), quoteIdent(c.User))
+}
+
+func mysqlCreateSQL(c config.Connection) string {
+	return fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s;", quoteMySQL(c.Database))
+}
+
+func databaseExists(ctx context.Context, c config.Connection, password string, log LogFunc) (bool, error) {
+	var (
+		name string
+		args []string
+	)
+	switch c.Engine {
+	case config.EnginePostgres:
+		name = "psql"
+		args = append(psqlArgs(c, "postgres"), "-X", "-w", "-tA", "-c",
+			fmt.Sprintf("SELECT 1 FROM pg_database WHERE datname = %s;", quoteLiteral(c.Database)))
+	case config.EngineMySQL:
+		name = "mysql"
+		args = append(mysqlArgs(c, ""), "-N", "-e",
+			fmt.Sprintf("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s;", quoteLiteral(c.Database)))
+	default:
+		return false, fmt.Errorf("unsupported engine %s", c.Engine)
+	}
+	rows, err := collectQuery(ctx, password, log, name, args)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}
+
+// CreateDatabase creates c.Database on the server. MySQL uses IF NOT EXISTS; Postgres errors if it already exists.
+func CreateDatabase(ctx context.Context, c config.Connection, password string, log LogFunc) error {
+	if err := requireCreds(c); err != nil {
+		return err
+	}
+	if c.Database == "" {
+		return fmt.Errorf("database name required")
+	}
+	bin := clientBin(c)
+	if _, err := lookPath(bin); err != nil {
+		return fmt.Errorf("missing client tools: %s", bin)
+	}
+	log("creating database " + c.Database)
+	switch c.Engine {
+	case config.EnginePostgres:
+		return commandRunner(ctx, password, log, "psql", psqlArgs(c, "postgres"), strings.NewReader(postgresCreateSQL(c)))
+	case config.EngineMySQL:
+		return commandRunner(ctx, password, log, "mysql", mysqlArgs(c, ""), strings.NewReader(mysqlCreateSQL(c)))
+	default:
+		return fmt.Errorf("unsupported engine %s", c.Engine)
+	}
+}
+
+// EnsureDatabase creates c.Database if it is missing. Existing databases are left unchanged.
+func EnsureDatabase(ctx context.Context, c config.Connection, password string, log LogFunc) error {
+	if err := requireCreds(c); err != nil {
+		return err
+	}
+	if c.Database == "" {
+		return fmt.Errorf("database name required")
+	}
+	bin := clientBin(c)
+	if _, err := lookPath(bin); err != nil {
+		return fmt.Errorf("missing client tools: %s", bin)
+	}
+	exists, err := databaseExists(ctx, c, password, log)
+	if err != nil {
+		return err
+	}
+	if exists {
+		log("database " + c.Database + " already exists")
+		return nil
+	}
+	return CreateDatabase(ctx, c, password, log)
+}
+
 func psqlArgs(c config.Connection, database string) []string {
 	return []string{
 		"-h", c.Host,
@@ -196,9 +387,27 @@ func mysqlArgs(c config.Connection, database string) []string {
 		"--connect-timeout=10",
 	}
 	if database != "" {
-		args = append(args, database)
+		args = append(args, "--", database)
 	}
 	return args
+}
+
+func safeCLIFileArg(path string) string {
+	if path == "" {
+		return path
+	}
+	if strings.HasPrefix(path, "-") {
+		return "./" + path
+	}
+	base := filepath.Base(path)
+	if strings.HasPrefix(base, "-") {
+		dir := filepath.Dir(path)
+		if dir == "." || dir == "" {
+			return "./" + base
+		}
+		return filepath.Join(dir, base)
+	}
+	return path
 }
 
 func quoteIdent(s string) string {

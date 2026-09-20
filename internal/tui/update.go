@@ -14,8 +14,12 @@ import (
 )
 
 var (
-	importDB = db.Import
-	exportDB = db.Export
+	importDB     = db.Import
+	exportDB     = db.Export
+	listDBs      = db.ListDatabases
+	testConn     = db.TestConnection
+	missingTools = db.MissingTools
+	ensureDB     = db.EnsureDatabase
 )
 
 func (m model) storeOrDefault() secret.Store {
@@ -58,6 +62,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.fileIdx >= len(m.files) {
 			m.fileIdx = 0
 		}
+		m.pruneDBCache()
+		m.showDBsForCurrent()
 		return m, nil
 
 	case tickMsg:
@@ -88,18 +94,25 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Quit
 	case "tab":
-		m.focus = (m.focus + 1) % 3
+		m.focus = (m.focus + 1) % paneCount
 		return m, nil
 	case "shift+tab":
-		m.focus = (m.focus + 2) % 3
+		m.focus = (m.focus + paneCount - 1) % paneCount
 		return m, nil
 	case "h", "left":
-		if m.focus > paneConns {
+		if m.focus == paneLogs {
+			m.focus = paneFiles
+			return m, nil
+		}
+		if m.focus > paneServers {
 			m.focus--
 		}
 		return m, nil
 	case "l", "right":
-		if m.focus < paneLogs {
+		if m.focus == paneLogs {
+			return m, nil
+		}
+		if m.focus < paneFiles {
 			m.focus++
 		}
 		return m, nil
@@ -107,34 +120,49 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.overlay = overlayHelp
 		return m, nil
 	case "r":
-		return m, reload(m.cwd)
+		return m.refreshAll()
 	case "c":
 		m.clearDB = !m.clearDB
 		return m, nil
 	case "p":
 		return m.beginPassword()
+	case "n":
+		return m.beginCreateDB()
 	case "i":
 		return m.beginImport()
 	case "e":
 		return m.beginExport()
+	case "a":
+		return m.beginAdd()
+	case "E":
+		if m.focus == paneServers {
+			return m.beginEdit()
+		}
+	case "d":
+		if m.focus == paneServers {
+			return m.beginDelete()
+		}
 	case "enter":
 		if m.focus == paneFiles {
 			return m.beginImport()
 		}
-		if m.focus == paneConns {
-			if c, ok := m.currentConn(); ok {
-				m = m.persistLastUsed(c)
-				if _, src := m.passwordFor(c); src == "" {
-					return m.beginPassword()
-				}
-			}
+		if m.focus == paneServers {
+			return m.connectServer()
 		}
 		return m, nil
 	}
 
 	switch m.focus {
-	case paneConns:
+	case paneServers:
+		prev := m.connIdx
 		m.connIdx = moveIndex(m.connIdx, len(m.conns), msg.String())
+		if m.connIdx != prev {
+			m.showDBsForCurrent()
+		}
+	case paneDBs:
+		if m.dbReady && m.dbErr == "" {
+			m.dbIdx = moveIndex(m.dbIdx, len(m.databases), msg.String())
+		}
 	case paneFiles:
 		m.fileIdx = moveIndex(m.fileIdx, len(m.files), msg.String())
 	case paneLogs:
@@ -160,6 +188,21 @@ func (m model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.savePassword(false)
 		}
 		return m, nil
+
+	case overlayCreateDB:
+		switch msg.String() {
+		case "esc":
+			m.overlay = overlayNone
+			m.dbInput.Blur()
+			return m, nil
+		case "enter":
+			m.overlay = overlayNone
+			m.dbInput.Blur()
+			return m.finishCreateDB(strings.TrimSpace(m.dbInput.Value()))
+		}
+		var cmd tea.Cmd
+		m.dbInput, cmd = m.dbInput.Update(msg)
+		return m, cmd
 
 	case overlayConfirmImport:
 		switch msg.String() {
@@ -204,16 +247,30 @@ func (m model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.pathInput, cmd = m.pathInput.Update(msg)
 		return m, cmd
+
+	case overlayAdd, overlayEdit:
+		return m.handleFormKey(msg)
+
+	case overlayConfirmDelete:
+		switch msg.String() {
+		case "esc":
+			m.overlay = overlayNone
+			return m, nil
+		case "enter", "y", "Y":
+			return m.confirmDelete()
+		}
+		return m, nil
 	}
 	return m, nil
 }
 
 func (m model) beginPassword() (tea.Model, tea.Cmd) {
 	if _, ok := m.currentConn(); !ok {
-		return m.showNotice("select a connection first")
+		return m.noticeAndLog("select a server first")
 	}
 	m.overlay = overlayPassword
 	m.pwInput.SetValue("")
+	m.pwInput.Placeholder = "leave empty for trust"
 	m.pwInput.Focus()
 	return m, textinput.Blink
 }
@@ -222,64 +279,258 @@ func (m model) savePassword(persist bool) (tea.Model, tea.Cmd) {
 	c, ok := m.currentConn()
 	m.overlay = overlayNone
 	if !ok {
+		m.pending = pendingNone
 		return m, nil
 	}
 	pw := m.pwInput.Value()
 	m.memPW[c.ID()] = pw
+	none := pw == ""
+	keyErr := ""
 	if persist {
-		if err := m.storeOrDefault().Set(c.ID(), pw); err != nil {
-			return m.showNotice("keychain save failed: " + err.Error() + " (using this session only)")
+		c.NoPassword = none
+		if i := indexByID(m.conns, c.ID()); i >= 0 {
+			m.conns[i].NoPassword = none
 		}
-		m.hasKey[c.ID()] = true
-		m = m.persistLastUsed(c)
+		if none {
+			_ = m.storeOrDefault().Delete(c.ID())
+			m.hasKey[c.ID()] = false
+			m = m.persistLastUsed(c)
+		} else if err := m.storeOrDefault().Set(c.ID(), pw); err != nil {
+			m.hasKey[c.ID()] = false
+			keyErr = "keychain save failed: " + err.Error() + " (using this session only)"
+			m = m.appendLog(keyErr)
+		} else {
+			m.hasKey[c.ID()] = true
+			m = m.persistLastUsed(c)
+		}
 	}
+	if keyErr != "" && m.pending == pendingNone {
+		return m.showNotice(keyErr)
+	}
+	return m.afterPassword()
+}
+
+func (m model) afterPassword() (tea.Model, tea.Cmd) {
+	switch m.pending {
+	case pendingImport:
+		m.pending = pendingNone
+		m.overlay = overlayConfirmImport
+		return m, nil
+	case pendingExport:
+		m.pending = pendingNone
+		return m.beginExport()
+	case pendingConnect:
+		m.pending = pendingNone
+		return m.connectServer()
+	case pendingCreateDB:
+		m.pending = pendingNone
+		return m.beginCreateDB()
+	default:
+		return m, nil
+	}
+}
+
+func (m model) connectServer() (tea.Model, tea.Cmd) {
+	c, ok := m.currentConn()
+	if !ok {
+		return m.noticeAndLog("select a server first")
+	}
+	if _, src := m.passwordFor(c); src == "" {
+		m.pending = pendingConnect
+		return m.beginPassword()
+	}
+	m = m.persistLastUsed(c)
+	return m.listServerDatabases(c)
+}
+
+func (m model) refreshAll() (tea.Model, tea.Cmd) {
+	cmd := reload(m.cwd)
+	c, ok := m.currentConn()
+	if !ok {
+		return m, cmd
+	}
+	if _, src := m.passwordFor(c); src == "" {
+		return m, cmd
+	}
+	tm, _ := m.listServerDatabases(c)
+	return tm, cmd
+}
+
+func (m model) listServerDatabases(c config.Connection) (tea.Model, tea.Cmd) {
+	pw, _ := m.passwordFor(c)
+	id := c.ID()
+	m.stickLog = true
+	m = m.appendLog("connect " + c.Short())
+	if err := testConn(context.Background(), c, pw, m.runner.Append); err != nil {
+		m.databases = nil
+		m.dbIdx = 0
+		m.dbReady = false
+		m.dbErr = err.Error()
+		delete(m.dbLists, id)
+		m.dbErrors[id] = m.dbErr
+		m.syncLogs()
+		return m.noticeAndLog("connect failed: " + err.Error())
+	}
+	names, err := listDBs(context.Background(), c, pw, m.runner.Append)
+	m.syncLogs()
+	if err != nil {
+		m.databases = nil
+		m.dbIdx = 0
+		m.dbReady = false
+		m.dbErr = err.Error()
+		delete(m.dbLists, id)
+		m.dbErrors[id] = m.dbErr
+		return m.noticeAndLog("list databases: " + err.Error())
+	}
+	m.dbErr = ""
+	m.databases = names
+	m.dbReady = true
+	m.dbIdx = pickDBIndex(names, c.LastDatabase, c.Database)
+	m.dbLists[id] = names
+	delete(m.dbErrors, id)
+	m = m.appendLog(fmt.Sprintf("listed %d databases", len(names)))
+	m = m.persistLastUsed(c)
 	return m, nil
 }
 
-func (m model) beginImport() (tea.Model, tea.Cmd) {
+func (m model) beginCreateDB() (tea.Model, tea.Cmd) {
 	c, ok := m.currentConn()
 	if !ok {
-		return m.showNotice("select a connection first")
-	}
-	if _, ok := m.currentFile(); !ok {
-		return m.showNotice("select a dump file first")
-	}
-	if m.runner.Running() {
-		return m.showNotice("a job is already running")
+		return m.noticeAndLog("select a server first")
 	}
 	if _, src := m.passwordFor(c); src == "" {
+		m.pending = pendingCreateDB
 		return m.beginPassword()
 	}
+	m.pending = pendingNone
+	m.overlay = overlayCreateDB
+	m.dbInput.SetValue("")
+	m.dbInput.Placeholder = "new database name"
+	m.dbInput.Focus()
+	return m, textinput.Blink
+}
+
+func (m model) finishCreateDB(name string) (tea.Model, tea.Cmd) {
+	name = strings.TrimSpace(name)
+	if err := config.ValidateDatabase(name); err != nil {
+		return m.noticeAndLog(err.Error())
+	}
+	c, ok := m.currentConn()
+	if !ok {
+		return m.noticeAndLog("select a server first")
+	}
+	if _, src := m.passwordFor(c); src == "" {
+		m.dbInput.SetValue(name)
+		m.pending = pendingCreateDB
+		return m.beginPassword()
+	}
+	for i, n := range m.databases {
+		if n == name {
+			m.dbIdx = i
+			m.focus = paneDBs
+			m = m.appendLog("using existing database " + name)
+			return m, nil
+		}
+	}
+	if m.runner.Running() {
+		return m.noticeAndLog("a job is already running")
+	}
+	pw, _ := m.passwordFor(c)
+	target := c.WithDatabase(name)
+	m.stickLog = true
+	m = m.appendLog("creating database " + name)
+	if err := ensureDB(context.Background(), target, pw, m.runner.Append); err != nil {
+		m.syncLogs()
+		return m.noticeAndLog("create database: " + err.Error())
+	}
+	m.syncLogs()
+	tm, cmd := m.listServerDatabases(c)
+	next := tm.(model)
+	next.dbIdx = pickDBIndex(next.databases, name)
+	next.focus = paneDBs
+	if !containsString(next.databases, name) {
+		next.databases = append(next.databases, name)
+		next.dbIdx = len(next.databases) - 1
+		next.dbLists[c.ID()] = next.databases
+	}
+	return next, cmd
+}
+
+func containsString(items []string, want string) bool {
+	for _, s := range items {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (m model) beginImport() (tea.Model, tea.Cmd) {
+	if _, ok := m.currentConn(); !ok {
+		return m.noticeAndLog("select a server first")
+	}
+	if _, ok := m.currentDB(); !ok {
+		return m.noticeAndLog("select a database first")
+	}
+	if _, ok := m.currentFile(); !ok {
+		return m.noticeAndLog("select a dump file first")
+	}
+	if m.runner.Running() {
+		return m.noticeAndLog("a job is already running")
+	}
+	c, _ := m.currentConn()
+	if _, src := m.passwordFor(c); src == "" {
+		m.pending = pendingImport
+		return m.beginPassword()
+	}
+	m.pending = pendingNone
 	m.overlay = overlayConfirmImport
 	return m, nil
 }
 
 func (m model) beginExport() (tea.Model, tea.Cmd) {
-	c, ok := m.currentConn()
+	c, ok := m.selectedTarget()
 	if !ok {
-		return m.showNotice("select a connection first")
+		if _, sok := m.currentConn(); !sok {
+			return m.noticeAndLog("select a server first")
+		}
+		return m.noticeAndLog("select a database first")
 	}
 	if m.runner.Running() {
-		return m.showNotice("a job is already running")
+		return m.noticeAndLog("a job is already running")
 	}
 	if _, src := m.passwordFor(c); src == "" {
+		m.pending = pendingExport
 		return m.beginPassword()
 	}
+	m.pending = pendingNone
 	m.overlay = overlayExportPath
-	m.pathInput.SetValue(defaultExportPath(c))
+	m.pathInput.SetValue(defaultExportPath(c.Database))
 	m.pathInput.CursorEnd()
 	m.pathInput.Focus()
 	return m, textinput.Blink
 }
 
 func (m model) startImportJob() (model, tea.Cmd) {
-	c, ok := m.currentConn()
+	c, ok := m.selectedTarget()
 	if !ok {
-		return m, nil
+		if _, sok := m.currentConn(); !sok {
+			return m.failStart("select a server first")
+		}
+		return m.failStart("select a database first")
 	}
 	file, ok := m.currentFile()
 	if !ok {
-		return m, nil
+		return m.failStart("select a dump file first")
+	}
+	if err := c.ValidateFields(); err != nil {
+		return m.failStart(err.Error())
+	}
+	if missing := missingTools(c, file, m.clearDB, false); len(missing) > 0 {
+		return m.failStart("missing client tools: " + strings.Join(missing, ", "))
+	}
+	if m.runner.Running() {
+		return m.failStart("a job is already running")
 	}
 	pw, _ := m.passwordFor(c)
 	clear := m.clearDB
@@ -291,33 +542,61 @@ func (m model) startImportJob() (model, tea.Cmd) {
 	if clear {
 		title += " (clear)"
 	}
-	m.runner.Start(title, func(ctx context.Context, log func(string)) error {
+	if !m.runner.Start(title, func(ctx context.Context, log func(string)) error {
 		path := rel
 		if !filepath.IsAbs(path) {
 			path = exportAbs(cwd, rel)
 		}
 		return importDB(ctx, c, pw, path, clear, log)
-	})
+	}) {
+		return m.failStart("a job is already running")
+	}
+	m.syncLogs()
 	return m, nil
 }
 
 func (m model) startExportJob(path string) (model, tea.Cmd) {
-	c, ok := m.currentConn()
+	c, ok := m.selectedTarget()
 	if !ok {
-		return m, nil
+		if _, sok := m.currentConn(); !sok {
+			return m.failStart("select a server first")
+		}
+		return m.failStart("select a database first")
+	}
+	if err := c.ValidateFields(); err != nil {
+		return m.failStart(err.Error())
 	}
 	if path == "" {
-		path = defaultExportPath(c)
+		path = defaultExportPath(c.Database)
+	}
+	cwd := m.cwd
+	out, err := resolveExportPath(cwd, path)
+	if err != nil {
+		return m.failStart(err.Error())
+	}
+	if missing := missingTools(c, "", false, true); len(missing) > 0 {
+		return m.failStart("missing client tools: " + strings.Join(missing, ", "))
+	}
+	if m.runner.Running() {
+		return m.failStart("a job is already running")
 	}
 	pw, _ := m.passwordFor(c)
-	cwd := m.cwd
 	m = m.persistLastUsed(c)
 	m.stickLog = true
-	out := exportAbs(cwd, path)
-	m.runner.Start("export "+c.Database+" -> "+path, func(ctx context.Context, log func(string)) error {
+	if !m.runner.Start("export "+c.Database+" -> "+path, func(ctx context.Context, log func(string)) error {
 		return exportDB(ctx, c, pw, out, log)
-	})
+	}) {
+		return m.failStart("a job is already running")
+	}
+	m.syncLogs()
 	return m, nil
+}
+
+func (m model) appendLog(s string) model {
+	m.runner.Append(s)
+	m.stickLog = true
+	m.syncLogs()
+	return m
 }
 
 func (m model) showNotice(s string) (tea.Model, tea.Cmd) {
@@ -326,13 +605,32 @@ func (m model) showNotice(s string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) noticeAndLog(s string) (tea.Model, tea.Cmd) {
+	m = m.appendLog(s)
+	return m.showNotice(s)
+}
+
+func (m model) failStart(s string) (model, tea.Cmd) {
+	m = m.appendLog(s)
+	m.notice = s
+	m.overlay = overlayNotice
+	return m, nil
+}
+
 func (m *model) sizeLogPane() {
-	_, _, logW, logH := paneSizes(m.width, m.height)
-	m.logVP.Width = max(1, logW-2)
-	m.logVP.Height = max(1, logH-2)
+	bodyH := max(1, m.height-2)
+	_, _, _, _, logH := paneSizes(m.width, bodyH)
+	frame := paneBorder(false)
+	innerW := max(1, m.width-frame.GetHorizontalFrameSize())
+	innerH := max(1, logH-frame.GetVerticalFrameSize())
+	m.logVP.Width = innerW
+	m.logVP.Height = max(1, innerH-1)
 }
 
 func (m *model) syncLogs() {
+	if m.runner.Running() {
+		m.stickLog = true
+	}
 	lines, _, _ := m.runner.Snapshot()
 	content := strings.Join(lines, "\n")
 	y := m.logVP.YOffset

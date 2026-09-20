@@ -112,13 +112,13 @@ func TestScanQuotedEnvLocal(t *testing.T) {
 func TestScanMergesSaved(t *testing.T) {
 	dir := t.TempDir()
 	saved := []config.Connection{{
-		Name:     "saved",
-		Engine:   config.EnginePostgres,
-		Host:     "db.example",
-		Port:     5432,
-		User:     "u",
-		Database: "d",
-		Source:   "config",
+		Name:         "saved",
+		Engine:       config.EnginePostgres,
+		Host:         "db.example",
+		Port:         5432,
+		User:         "u",
+		LastDatabase: "d",
+		Source:       "config",
 	}}
 	res, err := Scan(dir, saved)
 	if err != nil {
@@ -129,6 +129,79 @@ func TestScanMergesSaved(t *testing.T) {
 	}
 }
 
+func TestScanMergesSameServerDifferentDatabases(t *testing.T) {
+	dir := t.TempDir()
+	saved := []config.Connection{{
+		Name:         "saved",
+		Engine:       config.EnginePostgres,
+		Host:         "127.0.0.1",
+		Port:         5432,
+		User:         "app",
+		LastDatabase: "from-saved",
+		Source:       config.SourceSaved,
+	}}
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("DB_CONNECTION=pgsql\nDB_HOST=127.0.0.1\nDB_PORT=5432\nDB_DATABASE=epbt\nDB_USERNAME=app\nDB_PASSWORD=secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Scan(dir, saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Connections) != 1 {
+		t.Fatalf("same server must merge: %#v", res.Connections)
+	}
+	c := res.Connections[0]
+	if c.Database != "epbt" {
+		t.Fatalf("suggested db = %q", c.Database)
+	}
+	if c.LastDatabase != "from-saved" {
+		t.Fatalf("last db = %q", c.LastDatabase)
+	}
+	if res.EnvPasswords[c.ID()] != "secret" {
+		t.Fatalf("pw = %q", res.EnvPasswords[c.ID()])
+	}
+}
+
+func TestScanEmptyPasswordIsRecorded(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("DB_CONNECTION=pgsql\nDB_HOST=127.0.0.1\nDB_PORT=5432\nDB_DATABASE=epbt\nDB_USERNAME=app\nDB_PASSWORD=\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Scan(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Connections) != 1 {
+		t.Fatalf("conns = %#v", res.Connections)
+	}
+	pw, ok := res.EnvPasswords[res.Connections[0].ID()]
+	if !ok || pw != "" {
+		t.Fatalf("empty env password should be recorded: ok=%v pw=%q %#v", ok, pw, res.EnvPasswords)
+	}
+}
+
+func TestScanMergesSavedNoPassword(t *testing.T) {
+	dir := t.TempDir()
+	saved := []config.Connection{{
+		Engine:     config.EnginePostgres,
+		Host:       "127.0.0.1",
+		Port:       5432,
+		User:       "app",
+		Source:     config.SourceSaved,
+		NoPassword: true,
+	}}
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("DB_CONNECTION=pgsql\nDB_HOST=127.0.0.1\nDB_PORT=5432\nDB_DATABASE=epbt\nDB_USERNAME=app\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Scan(dir, saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Connections) != 1 || !res.Connections[0].NoPassword {
+		t.Fatalf("%#v", res.Connections)
+	}
+}
+
 func TestScanMissingDir(t *testing.T) {
 	if _, err := Scan(filepath.Join(t.TempDir(), "missing"), nil); err == nil {
 		t.Fatal("expected error")
@@ -136,23 +209,23 @@ func TestScanMissingDir(t *testing.T) {
 }
 
 func TestParseDatabaseURL(t *testing.T) {
-	c, pw, ok := parseDatabaseURL("postgres://app:s3cret@localhost:5434/epbt", ".env")
+	c, pw, hasPW, ok := parseDatabaseURL("postgres://app:s3cret@localhost:5434/epbt", ".env")
 	if !ok {
 		t.Fatal("expected parse ok")
 	}
 	if c.Engine != config.EnginePostgres || c.Host != "localhost" || c.Port != 5434 || c.User != "app" || c.Database != "epbt" {
 		t.Fatalf("conn = %#v", c)
 	}
-	if pw != "s3cret" {
-		t.Fatalf("pw = %q", pw)
+	if pw != "s3cret" || !hasPW {
+		t.Fatalf("pw = %q has=%v", pw, hasPW)
 	}
-	if _, _, ok := parseDatabaseURL("://bad", ".env"); ok {
+	if _, _, _, ok := parseDatabaseURL("://bad", ".env"); ok {
 		t.Fatal("bad url")
 	}
-	if _, _, ok := parseDatabaseURL("sqlite://x", ".env"); ok {
+	if _, _, _, ok := parseDatabaseURL("sqlite://x", ".env"); ok {
 		t.Fatal("sqlite")
 	}
-	if _, _, ok := parseDatabaseURL("postgres://localhost/", ".env"); ok {
+	if _, _, _, ok := parseDatabaseURL("postgres://localhost/", ".env"); ok {
 		t.Fatal("missing db")
 	}
 }
@@ -313,8 +386,8 @@ func TestServiceConnectionDefaults(t *testing.T) {
 		Image:       "mysql",
 		Environment: map[string]any{"MYSQL_ROOT_PASSWORD": "rootpw"},
 	}, "compose.yaml")
-	if ok {
-		t.Fatal("mysql without database should skip")
+	if !ok {
+		t.Fatal("mysql without database should still be a server")
 	}
 	c, pw, ok = serviceConnection("db", composeService{
 		Image: "mysql",
@@ -334,7 +407,7 @@ func TestParseEnvConnectionMissing(t *testing.T) {
 	if err := os.WriteFile(p, []byte("DB_CONNECTION=sqlite\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, ok, err := parseEnvConnection(p, ".env"); err != nil || ok {
+	if _, _, _, ok, err := parseEnvConnection(p, ".env"); err != nil || ok {
 		t.Fatalf("sqlite should skip ok=%v err=%v", ok, err)
 	}
 	if _, err := parseEnvFile(filepath.Join(dir, "missing")); err == nil {
