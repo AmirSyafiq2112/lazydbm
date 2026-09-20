@@ -8,16 +8,16 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// ANSI 0–15 so colors come from the terminal theme, like lazygit.
+// No hex and no custom backgrounds — the terminal background shows through.
 var (
-	colBg     = lipgloss.Color("#1a1b26")
-	colFg     = lipgloss.Color("#c0caf5")
-	colMuted  = lipgloss.Color("#565f89")
-	colCyan   = lipgloss.Color("#7dcfff")
-	colGreen  = lipgloss.Color("#9ece6a")
-	colYellow = lipgloss.Color("#e0af68")
-	colRed    = lipgloss.Color("#f7768e")
-	colBorder = lipgloss.Color("#3b4261")
-	colAccent = lipgloss.Color("#bb9af7")
+	colMuted  = lipgloss.Color("8") // bright black / theme gray
+	colCyan   = lipgloss.Color("6")
+	colGreen  = lipgloss.Color("2")
+	colYellow = lipgloss.Color("3")
+	colRed    = lipgloss.Color("1")
+	colAccent = lipgloss.Color("6")
+	colBorder = lipgloss.Color("8")
 )
 
 func (m model) View() string {
@@ -51,8 +51,6 @@ func (m model) viewHeader() string {
 	line := lipgloss.JoinHorizontal(lipgloss.Center, title, ver, cwd)
 	return lipgloss.NewStyle().
 		Width(m.width).
-		Foreground(colFg).
-		Background(lipgloss.Color("#16161e")).
 		Padding(0, 1).
 		Render(truncate(line, m.width-2))
 }
@@ -77,14 +75,12 @@ func (m model) viewFooter() string {
 	}
 
 	help := fmt.Sprintf("i import  e export  c clear:%s  p password  r refresh  ? help  q quit", clearLabel)
-	left := lipgloss.NewStyle().Foreground(colFg).Render(help)
+	left := help
 	right := stStyle.Render("job:" + status)
 	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right)-2)
 	row := left + strings.Repeat(" ", gap) + right
 	return lipgloss.NewStyle().
 		Width(m.width).
-		Background(lipgloss.Color("#16161e")).
-		Foreground(colFg).
 		Padding(0, 1).
 		Render(truncate(row, m.width-2))
 }
@@ -137,12 +133,12 @@ func (m model) viewListPane(title string, items []string, selected int, focused 
 		for i := start; i < end; i++ {
 			line := items[i]
 			cursor := "  "
-			style := lipgloss.NewStyle().Foreground(colFg)
+			style := lipgloss.NewStyle()
 			if i == selected {
 				cursor = "❯ "
-				style = lipgloss.NewStyle().Foreground(colGreen).Bold(true)
+				style = lipgloss.NewStyle().Bold(true).Foreground(colGreen)
 				if focused {
-					style = style.Background(lipgloss.Color("#1f2335"))
+					style = lipgloss.NewStyle().Bold(true).Reverse(true)
 				}
 			}
 			b.WriteString(style.Render(truncate(cursor+line, innerW)))
@@ -182,9 +178,7 @@ func (m model) viewLogPane(width, height int) string {
 func (m model) viewOverlay() string {
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colCyan).
-		Background(colBg).
-		Foreground(colFg).
+		BorderForeground(colGreen).
 		Padding(1, 2).
 		Width(min(72, max(40, m.width-8)))
 
@@ -262,13 +256,11 @@ func helpText(version string) string {
 func paneBorder(focused bool) lipgloss.Style {
 	fg := colBorder
 	if focused {
-		fg = colCyan
+		fg = colGreen
 	}
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(fg).
-		Background(colBg).
-		Foreground(colFg)
+		BorderForeground(fg)
 }
 
 func paneSizes(width, height int) (left, mid, right, paneH int) {

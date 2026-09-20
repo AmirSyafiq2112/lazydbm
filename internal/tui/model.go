@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type pane int
@@ -74,14 +75,14 @@ func Run(cwd, version string) error {
 }
 
 func newModel(cwd, version string) model {
-	pw := textinput.New()
+	pw := themeInput(textinput.New())
 	pw.EchoMode = textinput.EchoPassword
 	pw.EchoCharacter = '•'
 	pw.Placeholder = "password"
 	pw.Prompt = "> "
 	pw.CharLimit = 512
 
-	path := textinput.New()
+	path := themeInput(textinput.New())
 	path.Placeholder = "export path"
 	path.Prompt = "> "
 	path.CharLimit = 1024
@@ -205,4 +206,12 @@ func exportAbs(cwd, path string) string {
 		return path
 	}
 	return filepath.Join(cwd, path)
+}
+
+func themeInput(ti textinput.Model) textinput.Model {
+	ti.PromptStyle = lipgloss.NewStyle()
+	ti.TextStyle = lipgloss.NewStyle()
+	ti.PlaceholderStyle = lipgloss.NewStyle().Faint(true)
+	ti.CompletionStyle = lipgloss.NewStyle().Faint(true)
+	return ti
 }

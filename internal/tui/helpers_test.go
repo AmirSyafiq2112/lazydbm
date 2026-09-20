@@ -13,6 +13,7 @@ import (
 	"github.com/AmirSyafiq2112/lazydbm/internal/job"
 	"github.com/AmirSyafiq2112/lazydbm/internal/secret"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func sampleConn() config.Connection {
@@ -106,6 +107,18 @@ func TestExportAbsAndDefaultPath(t *testing.T) {
 	t.Cleanup(func() { now = orig })
 	if defaultExportPath(sampleConn()) != "epbt-20260920-130000.sql" {
 		t.Fatalf("path = %s", defaultExportPath(sampleConn()))
+	}
+}
+
+func TestThemeUsesTerminalPalette(t *testing.T) {
+	if colGreen != lipgloss.Color("2") || colCyan != lipgloss.Color("6") || colRed != lipgloss.Color("1") {
+		t.Fatal("theme colors must be ANSI 0-15, not hex")
+	}
+	if _, ok := paneBorder(true).GetBackground().(lipgloss.NoColor); !ok {
+		t.Fatal("focused pane must not paint a custom background")
+	}
+	if _, ok := paneBorder(false).GetBackground().(lipgloss.NoColor); !ok {
+		t.Fatal("inactive pane must not paint a custom background")
 	}
 }
 
