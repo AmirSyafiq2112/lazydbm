@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -24,15 +26,22 @@ func sampleConn() config.Connection {
 
 func testModel(t *testing.T) model {
 	t.Helper()
-	prevMissing, prevTest, prevList, prevEnsure := missingTools, testConn, listDBs, ensureDB
+	prevMissing, prevTest, prevList, prevSchemas, prevEnsure, prevPreview, prevDump := missingTools, testConn, listDBs, listSchemas, ensureDB, previewSchemas, dumpSchemas
 	missingTools = func(config.Connection, string, bool, bool) []string { return nil }
 	testConn = func(context.Context, config.Connection, string, db.LogFunc) error { return nil }
 	listDBs = func(context.Context, config.Connection, string, db.LogFunc) ([]string, error) {
 		return []string{"epbt", "postgres"}, nil
 	}
+	listSchemas = func(context.Context, config.Connection, string, db.LogFunc) ([]string, error) {
+		return []string{"public", "app"}, nil
+	}
 	ensureDB = func(context.Context, config.Connection, string, db.LogFunc) error { return nil }
+	previewSchemas = func(_ context.Context, _ config.Connection, _, schema string, _ db.LogFunc) ([]db.SchemaStat, error) {
+		return []db.SchemaStat{{Name: schema, Bytes: 4096}}, nil
+	}
+	dumpSchemas = func(string) ([]string, error) { return nil, nil }
 	t.Cleanup(func() {
-		missingTools, testConn, listDBs, ensureDB = prevMissing, prevTest, prevList, prevEnsure
+		missingTools, testConn, listDBs, listSchemas, ensureDB, previewSchemas, dumpSchemas = prevMissing, prevTest, prevList, prevSchemas, prevEnsure, prevPreview, prevDump
 	})
 	m := newModel("/tmp/app", "test")
 	m.store = secret.NewMemory()
@@ -1064,6 +1073,269 @@ func TestCreateDatabaseOverlay(t *testing.T) {
 	}
 	if m.focus != paneDBs {
 		t.Fatal(m.focus)
+	}
+}
+
+func TestClearSchemaDoesNotDropDatabase(t *testing.T) {
+	m := testModel(t)
+	m.envPW[sampleConn().ID()] = "pw"
+	m.schemaMode = true
+	m.schemaDB = "epbt"
+	m.schemas = []string{"public", "app"}
+	m.schemaIdx = 1
+	m.clearDB = true
+
+	tm, _ := m.beginImport()
+	m = asModel(t, tm)
+	overlay := m.viewOverlay()
+	if !strings.Contains(overlay, "epbt.app") || !strings.Contains(overlay, "DROP SCHEMA app") {
+		t.Fatalf("overlay = %s", overlay)
+	}
+	if strings.Contains(overlay, "DROP + CREATE") || strings.Contains(overlay, "all data in") {
+		t.Fatalf("schema clear must not offer a database drop: %s", overlay)
+	}
+
+	var cleared string
+	var importedClear bool
+	origI, origR := importDB, resetSchema
+	t.Cleanup(func() { importDB, resetSchema = origI, origR })
+	resetSchema = func(_ context.Context, c config.Connection, _, schema string, _ db.LogFunc) error {
+		cleared = c.Database + "." + schema
+		return nil
+	}
+	importDB = func(_ context.Context, _ config.Connection, _, _ string, clear bool, _ db.LogFunc) error {
+		importedClear = clear
+		return nil
+	}
+	m, _ = m.startImportJob()
+	if _, err := job.Wait(m.runner, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if cleared != "epbt.app" || importedClear {
+		t.Fatalf("cleared=%q import clear=%v", cleared, importedClear)
+	}
+}
+
+func TestClearSchemasFromDump(t *testing.T) {
+	m := testModel(t)
+	m.envPW[sampleConn().ID()] = "pw"
+	m.schemaMode = true
+	m.schemaDB = "epbt"
+	m.schemas = []string{"mswn", "spss"}
+	m.schemaIdx = 0
+	m.clearDB = true
+	m.files = []string{"epbt-mswn.sql"}
+	dumpSchemas = func(string) ([]string, error) {
+		return []string{"mswn", "spss", "spbt"}, nil
+	}
+
+	tm, _ := m.beginImport()
+	m = asModel(t, tm)
+	overlay := m.viewOverlay()
+	if !strings.Contains(overlay, "DROP 3 SCHEMAS") || !strings.Contains(overlay, "mswn") || !strings.Contains(overlay, "spss") || !strings.Contains(overlay, "spbt") {
+		t.Fatalf("overlay = %s", overlay)
+	}
+	if strings.Contains(overlay, "DROP + CREATE") {
+		t.Fatalf("schema clear must not offer a database drop: %s", overlay)
+	}
+
+	var cleared []string
+	var importedClear bool
+	origI, origR := importDB, resetSchema
+	t.Cleanup(func() { importDB, resetSchema = origI, origR })
+	resetSchema = func(_ context.Context, c config.Connection, _, schema string, _ db.LogFunc) error {
+		cleared = append(cleared, c.Database+"."+schema)
+		return nil
+	}
+	importDB = func(_ context.Context, _ config.Connection, _, _ string, clear bool, _ db.LogFunc) error {
+		importedClear = clear
+		return nil
+	}
+	m, _ = m.startImportJob()
+	if _, err := job.Wait(m.runner, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(cleared, ",") != "epbt.mswn,epbt.spss,epbt.spbt" || importedClear {
+		t.Fatalf("cleared=%v import clear=%v", cleared, importedClear)
+	}
+}
+
+func TestRefreshSQLFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "new.sql"), []byte("-- new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := testModel(t)
+	m.cwd = dir
+	m.files = []string{"old.sql"}
+	m.fileIdx = 0
+
+	tm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = asModel(t, tm)
+	if cmd == nil {
+		t.Fatal("refresh should rescan")
+	}
+	if len(m.files) != 1 || m.files[0] != "new.sql" {
+		t.Fatalf("files = %#v", m.files)
+	}
+	if !strings.Contains(m.View(), "new.sql") {
+		t.Fatal("file pane did not show new.sql")
+	}
+	lines, _, _ := m.runner.Snapshot()
+	if !strings.Contains(strings.Join(lines, "\n"), "refreshed 1 sql files") {
+		t.Fatalf("log = %#v", lines)
+	}
+}
+
+func TestSchemaExport(t *testing.T) {
+	m := testModel(t)
+	m.focus = paneDBs
+	m.envPW[sampleConn().ID()] = "pw"
+
+	tm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	if !m.schemaMode || m.schemaDB != "epbt" {
+		t.Fatalf("schema mode = %v db=%q", m.schemaMode, m.schemaDB)
+	}
+	if len(m.schemas) != 2 || m.schemas[0] != "public" {
+		t.Fatalf("schemas = %#v", m.schemas)
+	}
+	view := m.View()
+	if !strings.Contains(view, "schemas") || !strings.Contains(view, "public") || !strings.Contains(view, "app") {
+		t.Fatalf("schema pane missing: %s", view)
+	}
+
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = asModel(t, tm)
+	if schema, _ := m.currentSchema(); schema != "app" {
+		t.Fatalf("schema = %q", schema)
+	}
+	previewSchemas = func(_ context.Context, _ config.Connection, _, schema string, _ db.LogFunc) ([]db.SchemaStat, error) {
+		return []db.SchemaStat{{Name: schema, Bytes: 4096}, {Name: "auth", Bytes: 1048576}}, nil
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	m = asModel(t, tm)
+	if m.overlay != overlayExportPreview || m.exportSchema != "app" {
+		t.Fatalf("overlay=%d schema=%q", m.overlay, m.exportSchema)
+	}
+	preview := m.viewOverlay()
+	if !strings.Contains(preview, "epbt.app") || !strings.Contains(preview, "auth") || !strings.Contains(preview, "1.0 MB") || !strings.Contains(preview, "4.0 KB") {
+		t.Fatal(preview)
+	}
+
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = asModel(t, tm)
+	if m.overlay != overlayNone || m.runner.Running() {
+		t.Fatal("esc should cancel before export")
+	}
+
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	m = asModel(t, tm)
+	var gotSchemas []string
+	var gotDB string
+	orig := exportSchemas
+	t.Cleanup(func() { exportSchemas = orig })
+	exportSchemas = func(_ context.Context, c config.Connection, _ string, schemas []string, _ string, _ db.LogFunc) error {
+		gotSchemas = append([]string(nil), schemas...)
+		gotDB = c.Database
+		return nil
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	if _, err := job.Wait(m.runner, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if gotDB != "epbt" || strings.Join(gotSchemas, ",") != "app,auth" {
+		t.Fatalf("exported %s %v", gotDB, gotSchemas)
+	}
+
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	m = asModel(t, tm)
+	if m.schemaMode || m.exportSchema != "" {
+		t.Fatal("backspace should return to databases")
+	}
+	if !strings.Contains(m.View(), "databases") {
+		t.Fatal(m.View())
+	}
+}
+
+func TestLogFullViewScrolls(t *testing.T) {
+	m := testModel(t)
+	m.runner.Append("hello from job")
+	for i := 0; i < 80; i++ {
+		m.runner.Append(fmt.Sprintf("line %d", i))
+	}
+	tm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = asModel(t, tm)
+	if !m.logFull {
+		t.Fatal("f should open the full log")
+	}
+	out := m.View()
+	if !strings.Contains(out, "full") || !strings.Contains(out, "esc close") {
+		t.Fatalf("full log view = %q", out)
+	}
+	if strings.Contains(out, "servers") {
+		t.Fatal("full log should hide the other panes")
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = asModel(t, tm)
+	if m.logVP.YOffset != 0 {
+		t.Fatalf("g offset = %d", m.logVP.YOffset)
+	}
+	top := m.View()
+	if !strings.Contains(top, "hello from job") {
+		t.Fatalf("top of log = %q", top)
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = asModel(t, tm)
+	if m.logVP.YOffset < 1 {
+		t.Fatalf("j offset = %d", m.logVP.YOffset)
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = asModel(t, tm)
+	if m.logFull {
+		t.Fatal("esc should close the full log")
+	}
+	if !strings.Contains(m.View(), "servers") {
+		t.Fatal("panes should return")
+	}
+}
+
+func TestFileSearchFiltersSelection(t *testing.T) {
+	m := testModel(t)
+	m.focus = paneFiles
+	m.files = []string{"dump.sql", "reports/other.sql", "seed/users.sql"}
+	m.fileIdx = 0
+
+	tm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = asModel(t, tm)
+	if !m.fileSearch {
+		t.Fatal("slash should start file search")
+	}
+	for _, r := range []rune{'o', 't', 'h', 'e', 'r'} {
+		tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = asModel(t, tm)
+	}
+	if got := m.fileLines(); len(got) != 1 || got[0] != "reports/other.sql" {
+		t.Fatalf("filtered = %#v", got)
+	}
+	if f, ok := m.currentFile(); !ok || f != "reports/other.sql" {
+		t.Fatalf("selected = %q ok=%v", f, ok)
+	}
+	if !strings.Contains(m.View(), "files /other") {
+		t.Fatal(m.View())
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	if m.fileSearch || m.fileQuery != "other" {
+		t.Fatalf("enter should keep filter: search=%v query=%q", m.fileSearch, m.fileQuery)
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = asModel(t, tm)
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = asModel(t, tm)
+	if m.fileSearch || m.fileQuery != "" || len(m.fileLines()) != 3 {
+		t.Fatalf("esc should clear search: %+v lines=%#v", m.fileQuery, m.fileLines())
 	}
 }
 

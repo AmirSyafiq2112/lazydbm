@@ -442,7 +442,7 @@ func TestExportPostgresAndMySQL(t *testing.T) {
 	if err := Export(context.Background(), pgConn(), "pw", out, func(string) {}); err != nil {
 		t.Fatal(err)
 	}
-	if rec.calls[0].name != "pg_dump" || !contains(rec.calls[0].args, "--no-owner") {
+	if rec.calls[0].name != "pg_dump" || !contains(rec.calls[0].args, "--no-owner") || !containsPrefix(rec.calls[0].args, "--file=") {
 		t.Fatalf("pg_dump args = %v", rec.calls[0].args)
 	}
 	if _, err := os.Stat(out); err != nil {
@@ -454,8 +454,115 @@ func TestExportPostgresAndMySQL(t *testing.T) {
 	if err := Export(context.Background(), myConn(), "pw", out, func(string) {}); err != nil {
 		t.Fatal(err)
 	}
-	if rec.calls[0].name != "mysqldump" || !contains(rec.calls[0].args, "--single-transaction") {
+	if rec.calls[0].name != "mysqldump" || !contains(rec.calls[0].args, "--single-transaction") || !containsPrefix(rec.calls[0].args, "--result-file=") {
 		t.Fatalf("mysqldump args = %v", rec.calls[0].args)
+	}
+}
+
+func TestExportSchema(t *testing.T) {
+	rec := withFakeExec(t, nil)
+	rec.output = []string{"app.orders.orders_user_fkey -> auth.users"}
+	var logs []string
+	dir := t.TempDir()
+	out := filepath.Join(dir, "epbt-app.sql")
+	err := ExportSchema(context.Background(), pgConn(), "pw", "app", out, func(s string) {
+		logs = append(logs, s)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 2 || rec.calls[0].name != "psql" || rec.calls[1].name != "pg_dump" {
+		t.Fatalf("calls = %#v", rec.calls)
+	}
+	args := rec.calls[1].args
+	if !contains(args, "--schema") || !contains(args, `"app"`) || !contains(args, "--no-owner") || !containsPrefix(args, "--file=") {
+		t.Fatalf("pg_dump args = %v", args)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "outside schema app") || !strings.Contains(joined, "auth.users (not in this dump)") {
+		t.Fatalf("logs = %s", joined)
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ExportSchema(context.Background(), myConn(), "pw", "app", out, func(string) {}); err == nil {
+		t.Fatal("mysql schema export")
+	}
+	if err := ExportSchema(context.Background(), pgConn(), "pw", "bad*name", out, func(string) {}); err == nil {
+		t.Fatal("wildcard schema")
+	}
+}
+
+func TestPreviewSchemaExport(t *testing.T) {
+	rec := withFakeExec(t, nil)
+	rec.output = []string{"spss|1048576", "mswn|4096", "spbt|2048"}
+	stats, err := PreviewSchemaExport(context.Background(), pgConn(), "pw", "mswn", func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 3 || stats[0].Name != "mswn" || stats[0].Bytes != 4096 {
+		t.Fatalf("stats = %#v", stats)
+	}
+	if stats[1].Name != "spss" || stats[1].Bytes != 1048576 || stats[2].Name != "spbt" {
+		t.Fatalf("order = %#v", stats)
+	}
+	query := strings.Join(rec.calls[0].args, " ")
+	if rec.calls[0].name != "psql" || !strings.Contains(query, "WITH RECURSIVE") || !strings.Contains(query, "pg_total_relation_size") || !strings.Contains(query, "'mswn'") {
+		t.Fatalf("args = %v", rec.calls[0].args)
+	}
+	if FormatBytes(0) != "0 B" || FormatBytes(4096) != "4.0 KB" || FormatBytes(1048576) != "1.0 MB" || FormatBytes(10<<20) != "10 MB" {
+		t.Fatalf("sizes %q %q %q %q", FormatBytes(0), FormatBytes(4096), FormatBytes(1048576), FormatBytes(10<<20))
+	}
+
+	rec.output = []string{"other|1"}
+	if _, err := PreviewSchemaExport(context.Background(), pgConn(), "pw", "mswn", func(string) {}); err == nil {
+		t.Fatal("missing selected schema")
+	}
+	if _, err := PreviewSchemaExport(context.Background(), myConn(), "pw", "mswn", func(string) {}); err == nil {
+		t.Fatal("mysql preview")
+	}
+}
+
+func TestExportSchemas(t *testing.T) {
+	rec := withFakeExec(t, nil)
+	dir := t.TempDir()
+	out := filepath.Join(dir, "epbt-mswn.sql")
+	var logs []string
+	err := ExportSchemas(context.Background(), pgConn(), "pw", []string{"mswn", "spss", "spbt"}, out, func(s string) {
+		logs = append(logs, s)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].name != "pg_dump" {
+		t.Fatalf("calls = %#v", rec.calls)
+	}
+	args := rec.calls[0].args
+	if !contains(args, `"mswn"`) || !contains(args, `"spss"`) || !contains(args, `"spbt"`) || !containsPrefix(args, "--file=") {
+		t.Fatalf("pg_dump args = %v", args)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "3 schemas") || !strings.Contains(joined, "mswn, spss, spbt") {
+		t.Fatalf("logs = %s", joined)
+	}
+}
+
+func TestListSchemas(t *testing.T) {
+	rec := withFakeExec(t, nil)
+	rec.output = []string{"public", "app", "bad/name"}
+	names, err := ListSchemas(context.Background(), pgConn(), "pw", func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(names, ",") != "app,public" {
+		t.Fatalf("names = %#v", names)
+	}
+	if rec.calls[0].name != "psql" || !containsQuery(rec.calls[0].args, "pg_namespace") || !containsQuery(rec.calls[0].args, "pg_temp_") {
+		t.Fatalf("args = %v", rec.calls[0].args)
+	}
+	if _, err := ListSchemas(context.Background(), myConn(), "pw", func(string) {}); err == nil {
+		t.Fatal("mysql schemas")
 	}
 }
 
@@ -469,6 +576,40 @@ func TestExportValidation(t *testing.T) {
 	withFakeExec(t, map[string]bool{"pg_dump": true})
 	if err := Export(context.Background(), pgConn(), "", filepath.Join(t.TempDir(), "x.sql"), func(string) {}); err == nil {
 		t.Fatal("missing pg_dump")
+	}
+}
+
+func TestResetSchema(t *testing.T) {
+	sql := postgresResetSchemaSQL("app")
+	if sql != `DROP SCHEMA IF EXISTS "app" CASCADE;` {
+		t.Fatalf("sql = %s", sql)
+	}
+	if strings.Contains(sql, "DROP DATABASE") {
+		t.Fatal(sql)
+	}
+
+	rec := withFakeExec(t, nil)
+	rec.output = []string{"billing.invoices.fk -> app.orders"}
+	var logs []string
+	err := ResetSchema(context.Background(), pgConn(), "pw", "app", func(s string) { logs = append(logs, s) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 2 || rec.calls[0].name != "psql" || rec.calls[1].name != "psql" {
+		t.Fatalf("calls = %#v", rec.calls)
+	}
+	if !contains(rec.calls[1].args, "epbt") || strings.Contains(rec.calls[1].stdin, "DROP DATABASE") {
+		t.Fatalf("reset args=%v stdin=%s", rec.calls[1].args, rec.calls[1].stdin)
+	}
+	if !strings.Contains(rec.calls[1].stdin, `DROP SCHEMA IF EXISTS "app" CASCADE`) {
+		t.Fatalf("stdin = %s", rec.calls[1].stdin)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "clearing schema app") || !strings.Contains(joined, "CASCADE will also drop 1") {
+		t.Fatalf("logs = %s", joined)
+	}
+	if err := ResetSchema(context.Background(), myConn(), "pw", "app", func(string) {}); err == nil {
+		t.Fatal("mysql schema clear")
 	}
 }
 
@@ -511,6 +652,24 @@ func TestRunUsesEcho(t *testing.T) {
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsPrefix(ss []string, prefix string) bool {
+	for _, s := range ss {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsQuery(args []string, snippet string) bool {
+	for _, s := range args {
+		if strings.Contains(s, snippet) {
 			return true
 		}
 	}

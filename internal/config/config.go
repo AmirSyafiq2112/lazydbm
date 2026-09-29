@@ -76,15 +76,29 @@ func (c Connection) ValidateFields() error {
 }
 
 func ValidateDatabase(name string) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return fmt.Errorf("invalid database name")
-	}
-	if err := rejectCLIUnsafe(name); err != nil {
+	return validateName(name, "database")
+}
+
+func ValidateSchema(name string) error {
+	if err := validateName(name, "schema"); err != nil {
 		return err
 	}
+	if strings.ContainsAny(name, "*?[") {
+		return fmt.Errorf("invalid schema name")
+	}
+	return nil
+}
+
+func validateName(name, kind string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("invalid %s name", kind)
+	}
+	if err := rejectCLIUnsafe(name); err != nil {
+		return fmt.Errorf("invalid %s name", kind)
+	}
 	if strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
-		return fmt.Errorf("invalid database name")
+		return fmt.Errorf("invalid %s name", kind)
 	}
 	return nil
 }

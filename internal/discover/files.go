@@ -16,6 +16,11 @@ var skipDirs = map[string]struct{}{
 	".vscode":      {},
 }
 
+// Files returns dump files in cwd and one level of subdirectories.
+func Files(cwd string) ([]string, error) {
+	return dumpFiles(cwd)
+}
+
 func dumpFiles(cwd string) ([]string, error) {
 	var files []string
 	entries, err := os.ReadDir(cwd)

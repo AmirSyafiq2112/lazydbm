@@ -163,6 +163,28 @@ func TestFilterKeepsQuotedSemicolon(t *testing.T) {
 	}
 }
 
+func TestSchemasInPostgresSQL(t *testing.T) {
+	in := strings.Join([]string{
+		"-- CREATE SCHEMA hidden;",
+		"CREATE SCHEMA mswn;",
+		`CREATE SCHEMA "spss";`,
+		"CREATE SCHEMA IF NOT EXISTS spbt;",
+		"CREATE SCHEMA mswn AUTHORIZATION app;",
+		"COPY mswn.t (id) FROM stdin;",
+		"CREATE SCHEMA inside_copy;",
+		`\.`,
+		"CREATE SCHEMA after_copy;",
+		"",
+	}, "\n")
+	names, err := SchemasInPostgresSQL(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(names, ",") != "mswn,spss,spbt,after_copy" {
+		t.Fatalf("names = %#v", names)
+	}
+}
+
 func TestFilterEmptyDollarBody(t *testing.T) {
 	in := "SELECT $$$$ AS empty;\nALTER TABLE t OWNER TO x;\n"
 	got := filterSQL(t, in)

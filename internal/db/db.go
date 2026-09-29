@@ -226,6 +226,184 @@ func Import(ctx context.Context, c config.Connection, password, file string, cle
 }
 
 func Export(ctx context.Context, c config.Connection, password, out string, log LogFunc) error {
+	return export(ctx, c, password, nil, out, log)
+}
+
+// ExportSchema dumps one Postgres schema, including its tables and rows.
+// Foreign keys that point at other schemas are logged and left in the dump; those tables are not included.
+func ExportSchema(ctx context.Context, c config.Connection, password, schema, out string, log LogFunc) error {
+	schema = strings.TrimSpace(schema)
+	if schema == "" {
+		return fmt.Errorf("no schema selected")
+	}
+	if err := config.ValidateSchema(schema); err != nil {
+		return err
+	}
+	if c.Engine != config.EnginePostgres {
+		return fmt.Errorf("schema export is only supported for postgres")
+	}
+	return export(ctx, c, password, []string{schema}, out, log)
+}
+
+// SchemaStat is one schema in an export preview.
+type SchemaStat struct {
+	Name  string
+	Bytes int64
+}
+
+// PreviewSchemaExport lists the selected schema and every schema it reaches
+// through foreign keys, with the on-disk size of each. Nothing is dumped.
+func PreviewSchemaExport(ctx context.Context, c config.Connection, password, schema string, log LogFunc) ([]SchemaStat, error) {
+	schema = strings.TrimSpace(schema)
+	if schema == "" {
+		return nil, fmt.Errorf("no schema selected")
+	}
+	if err := config.ValidateSchema(schema); err != nil {
+		return nil, err
+	}
+	if c.Engine != config.EnginePostgres {
+		return nil, fmt.Errorf("schema export is only supported for postgres")
+	}
+	if err := requireCreds(c); err != nil {
+		return nil, err
+	}
+	if c.Database == "" {
+		return nil, fmt.Errorf("database name required")
+	}
+	if _, err := lookPath("psql"); err != nil {
+		return nil, fmt.Errorf("missing client tools: psql")
+	}
+	args := append(psqlArgs(c, c.Database), "-X", "-w", "-tA", "-F", "|", "-c", schemaPreviewSQL(schema))
+	lines, err := collectQuery(ctx, password, log, "psql", args)
+	if err != nil {
+		return nil, err
+	}
+	stats := make([]SchemaStat, 0, len(lines))
+	for _, line := range lines {
+		name, raw, ok := strings.Cut(line, "|")
+		if !ok {
+			return nil, fmt.Errorf("unexpected schema preview row %q", line)
+		}
+		name = strings.TrimSpace(name)
+		if err := config.ValidateSchema(name); err != nil {
+			continue
+		}
+		bytes, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("schema size for %s: %w", name, err)
+		}
+		stats = append(stats, SchemaStat{Name: name, Bytes: bytes})
+	}
+	found := false
+	for _, s := range stats {
+		if s.Name == schema {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("schema %s not found", schema)
+	}
+	return orderSchemaStats(schema, stats), nil
+}
+
+// ExportSchemas dumps the given Postgres schemas in one pg_dump file.
+func ExportSchemas(ctx context.Context, c config.Connection, password string, schemas []string, out string, log LogFunc) error {
+	if len(schemas) == 0 {
+		return fmt.Errorf("no schema selected")
+	}
+	cleaned := make([]string, 0, len(schemas))
+	seen := map[string]struct{}{}
+	for _, schema := range schemas {
+		schema = strings.TrimSpace(schema)
+		if err := config.ValidateSchema(schema); err != nil {
+			return err
+		}
+		if _, ok := seen[schema]; ok {
+			continue
+		}
+		seen[schema] = struct{}{}
+		cleaned = append(cleaned, schema)
+	}
+	if c.Engine != config.EnginePostgres {
+		return fmt.Errorf("schema export is only supported for postgres")
+	}
+	return export(ctx, c, password, cleaned, out, log)
+}
+
+func schemaPreviewSQL(schema string) string {
+	return fmt.Sprintf(`
+WITH RECURSIVE reach(nspname) AS (
+  SELECT nspname FROM pg_namespace WHERE nspname = %s
+  UNION
+  SELECT fn.nspname
+  FROM reach r
+  JOIN pg_namespace n ON n.nspname = r.nspname
+  JOIN pg_class c ON c.relnamespace = n.oid
+  JOIN pg_constraint con ON con.conrelid = c.oid AND con.contype = 'f'
+  JOIN pg_class f ON f.oid = con.confrelid
+  JOIN pg_namespace fn ON fn.oid = f.relnamespace
+  WHERE fn.nspname <> r.nspname
+    AND fn.nspname <> 'information_schema'
+    AND fn.nspname <> 'pg_catalog'
+    AND fn.nspname <> 'pg_toast'
+    AND strpos(fn.nspname, 'pg_temp_') <> 1
+    AND strpos(fn.nspname, 'pg_toast_temp_') <> 1
+)
+SELECT r.nspname, COALESCE(SUM(pg_total_relation_size(c.oid)), 0)::bigint
+FROM reach r
+LEFT JOIN pg_namespace n ON n.nspname = r.nspname
+LEFT JOIN pg_class c ON c.relnamespace = n.oid
+  AND c.relkind IN ('r', 'p', 'm')
+  AND NOT c.relispartition
+GROUP BY r.nspname;`, quoteLiteral(schema))
+}
+
+func orderSchemaStats(selected string, stats []SchemaStat) []SchemaStat {
+	var head *SchemaStat
+	rest := make([]SchemaStat, 0, len(stats))
+	for _, s := range stats {
+		if s.Name == selected && head == nil {
+			cp := s
+			head = &cp
+			continue
+		}
+		rest = append(rest, s)
+	}
+	sort.Slice(rest, func(i, j int) bool {
+		if rest[i].Bytes != rest[j].Bytes {
+			return rest[i].Bytes > rest[j].Bytes
+		}
+		return rest[i].Name < rest[j].Name
+	})
+	if head == nil {
+		return rest
+	}
+	return append([]SchemaStat{*head}, rest...)
+}
+
+// FormatBytes renders a byte count for the export preview.
+func FormatBytes(n int64) string {
+	if n < 0 {
+		n = 0
+	}
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	units := []string{"KB", "MB", "GB", "TB", "PB"}
+	v := float64(n)
+	i := -1
+	for v >= 1024 && i < len(units)-1 {
+		v /= 1024
+		i++
+	}
+	if v >= 10 {
+		return fmt.Sprintf("%.0f %s", v, units[i])
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
+}
+
+func export(ctx context.Context, c config.Connection, password string, schemas []string, out string, log LogFunc) error {
 	if out == "" {
 		return fmt.Errorf("no export path")
 	}
@@ -240,21 +418,193 @@ func Export(ctx context.Context, c config.Connection, password, out string, log 
 			return err
 		}
 	}
-	log("exporting " + c.Database + " -> " + out)
+	switch len(schemas) {
+	case 0:
+		log("exporting " + c.Database + " -> " + out)
+	case 1:
+		log("exporting schema " + schemas[0] + " from " + c.Database + " -> " + out)
+		if err := logOutboundFKs(ctx, c, password, schemas[0], log); err != nil {
+			log("cross-schema check failed: " + err.Error())
+		}
+	default:
+		log(fmt.Sprintf("exporting %d schemas from %s -> %s", len(schemas), c.Database, out))
+		log(strings.Join(schemas, ", "))
+	}
+	// Touch the file so a failed start still leaves a path, then let the client write it.
 	f, err := os.Create(out)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
 
 	switch c.Engine {
 	case config.EnginePostgres:
-		return commandRunner(ctx, password, log, "pg_dump", append(pgConnArgs(c, c.Database), "--no-owner", "--no-acl"), f)
+		args := append(pgConnArgs(c, c.Database), "--no-owner", "--no-acl")
+		for _, schema := range schemas {
+			args = append(args, "--schema", quoteIdent(schema))
+		}
+		args = append(args, "--file="+out)
+		return commandRunner(ctx, password, log, "pg_dump", args, nil)
 	case config.EngineMySQL:
-		return commandRunner(ctx, password, log, "mysqldump", append(mysqlArgs(c, c.Database), "--single-transaction", "--routines", "--triggers"), f)
+		args := mysqlArgs(c, "")
+		args = append(args, "--single-transaction", "--routines", "--triggers", "--result-file="+out, "--", c.Database)
+		return commandRunner(ctx, password, log, "mysqldump", args, nil)
 	default:
 		return fmt.Errorf("unsupported engine %s", c.Engine)
 	}
+}
+
+// ListSchemas returns user schemas in c.Database. Postgres only.
+func ListSchemas(ctx context.Context, c config.Connection, password string, log LogFunc) ([]string, error) {
+	if c.Engine != config.EnginePostgres {
+		return nil, fmt.Errorf("schema list is only supported for postgres")
+	}
+	if err := requireCreds(c); err != nil {
+		return nil, err
+	}
+	if c.Database == "" {
+		return nil, fmt.Errorf("database name required")
+	}
+	if err := c.ValidateFields(); err != nil {
+		return nil, err
+	}
+	if _, err := lookPath("psql"); err != nil {
+		return nil, fmt.Errorf("missing client tools: psql")
+	}
+	args := append(psqlArgs(c, c.Database), "-X", "-w", "-tA", "-c", `
+SELECT nspname FROM pg_namespace
+WHERE nspname <> 'information_schema'
+  AND nspname <> 'pg_catalog'
+  AND nspname <> 'pg_toast'
+  AND strpos(nspname, 'pg_temp_') <> 1
+  AND strpos(nspname, 'pg_toast_temp_') <> 1
+ORDER BY 1;`)
+	lines, err := collectQuery(ctx, password, log, "psql", args)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(lines))
+	seen := map[string]struct{}{}
+	for _, line := range lines {
+		if _, ok := seen[line]; ok {
+			continue
+		}
+		if err := config.ValidateSchema(line); err != nil {
+			continue
+		}
+		seen[line] = struct{}{}
+		names = append(names, line)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func logOutboundFKs(ctx context.Context, c config.Connection, password, schema string, log LogFunc) error {
+	if _, err := lookPath("psql"); err != nil {
+		log("cross-schema check skipped: psql not found")
+		return nil
+	}
+	query := fmt.Sprintf(`
+SELECT n.nspname || '.' || c.relname || '.' || con.conname || ' -> ' || fn.nspname || '.' || f.relname
+FROM pg_constraint con
+JOIN pg_class c ON c.oid = con.conrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_class f ON f.oid = con.confrelid
+JOIN pg_namespace fn ON fn.oid = f.relnamespace
+WHERE con.contype = 'f'
+  AND n.nspname = %s
+  AND fn.nspname <> %s
+ORDER BY 1;`, quoteLiteral(schema), quoteLiteral(schema))
+	args := append(psqlArgs(c, c.Database), "-X", "-w", "-tA", "-q", "-c", query)
+	var lines []string
+	err := commandRunner(ctx, password, func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || strings.HasPrefix(s, "$ ") {
+			return
+		}
+		lines = append(lines, s)
+	}, "psql", args, nil)
+	if err != nil {
+		return err
+	}
+	if len(lines) == 0 {
+		log("no foreign keys point outside schema " + schema)
+		return nil
+	}
+	log(fmt.Sprintf("%d foreign keys point outside schema %s", len(lines), schema))
+	for _, line := range lines {
+		log(line + " (not in this dump)")
+	}
+	return nil
+}
+
+func logInboundFKs(ctx context.Context, c config.Connection, password, schema string, log LogFunc) error {
+	if _, err := lookPath("psql"); err != nil {
+		log("cross-schema check skipped: psql not found")
+		return nil
+	}
+	query := fmt.Sprintf(`
+SELECT n.nspname || '.' || c.relname || '.' || con.conname || ' -> ' || fn.nspname || '.' || f.relname
+FROM pg_constraint con
+JOIN pg_class c ON c.oid = con.conrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_class f ON f.oid = con.confrelid
+JOIN pg_namespace fn ON fn.oid = f.relnamespace
+WHERE con.contype = 'f'
+  AND fn.nspname = %s
+  AND n.nspname <> %s
+ORDER BY 1;`, quoteLiteral(schema), quoteLiteral(schema))
+	args := append(psqlArgs(c, c.Database), "-X", "-w", "-tA", "-q", "-c", query)
+	var lines []string
+	err := commandRunner(ctx, password, func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || strings.HasPrefix(s, "$ ") {
+			return
+		}
+		lines = append(lines, s)
+	}, "psql", args, nil)
+	if err != nil {
+		return err
+	}
+	if len(lines) == 0 {
+		log("no foreign keys in other schemas point at " + schema)
+		return nil
+	}
+	log(fmt.Sprintf("CASCADE will also drop %d foreign keys in other schemas", len(lines)))
+	for _, line := range lines {
+		log(line)
+	}
+	return nil
+}
+
+func postgresResetSchemaSQL(schema string) string {
+	// The dump recreates the schema with CREATE SCHEMA. Creating it here makes that statement fail.
+	return fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE;", quoteIdent(schema))
+}
+
+// ResetSchema drops one schema inside c.Database. The rest of the database stays.
+// The following import is expected to recreate the schema.
+func ResetSchema(ctx context.Context, c config.Connection, password, schema string, log LogFunc) error {
+	schema = strings.TrimSpace(schema)
+	if err := config.ValidateSchema(schema); err != nil {
+		return err
+	}
+	if c.Engine != config.EnginePostgres {
+		return fmt.Errorf("schema clear is only supported for postgres")
+	}
+	if !c.Valid() {
+		return fmt.Errorf("incomplete connection")
+	}
+	if _, err := lookPath("psql"); err != nil {
+		return fmt.Errorf("missing client tools: psql")
+	}
+	log("clearing schema " + schema + " in " + c.Database)
+	if err := logInboundFKs(ctx, c, password, schema, log); err != nil {
+		log("cross-schema check failed: " + err.Error())
+	}
+	return commandRunner(ctx, password, log, "psql", psqlArgs(c, c.Database), strings.NewReader(postgresResetSchemaSQL(schema)))
 }
 
 func postgresResetSQL(c config.Connection) string {

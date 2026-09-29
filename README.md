@@ -53,17 +53,20 @@ If `.env` points at a compose service name (`DB_HOST=postgres`), lazydbm rewrite
 | Key | Action |
 | --- | --- |
 | `tab` / `h` `l` | Servers → databases → files (`tab` also reaches the log) |
-| `j` `k` / arrows | Move in the focused pane |
-| `enter` | On a server: connect, test, list databases. On a file: import |
+| `j` `k` / arrows | Move in the focused pane. On the log: scroll |
+| `f` | Full-screen log. `j` `k` scroll, `g` / `G` top and bottom, `esc` or `f` closes |
+| `/` | Search the files pane (type, `enter` keeps the filter, `esc` clears it) |
+| `enter` | On a server: connect, test, list databases. On a Postgres database: list schemas. On a schema: export that schema. On a file: import |
+| `backspace` | Leave the schema list and return to databases |
 | `i` | Import selected file into selected database (confirm + optional clear). Creates the database if it is missing. Postgres skips owners and grants (same as `pg_restore --no-owner --no-acl`). |
-| `e` | Export selected database |
+| `e` | Export the selected database. From a schema list, preview that schema plus every schema it reaches through foreign keys, with each schema's size. Enter starts the export. Esc cancels before anything is dumped |
 | `n` | Create a database on the connected server (or select it if it already exists) |
 | `a` | Add a saved server (engine, host, port, user, password — no database field) |
 | `E` | Edit a saved server (or clone a discovered one) |
 | `d` | Delete a saved server |
-| `c` | Toggle clear-db (drop + create before import) |
+| `c` | Toggle clear before import. On the database list this drops the database. On the schema list this drops every schema the dump creates (`CREATE SCHEMA` in the file). The confirm lists them before anything is dropped |
 | `p` | Set / save password for the server |
-| `r` | Re-list databases on the current server and refresh files |
+| `r` | Refresh the SQL file list. Also re-lists databases when a server is connected |
 | `?` | Help |
 | `q` / `ctrl+c` | Quit (cancels a running job first) |
 

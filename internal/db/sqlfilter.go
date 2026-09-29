@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"os"
 	"regexp"
 	"strings"
 	"unicode"
+
+	"github.com/AmirSyafiq2112/lazydbm/internal/config"
 )
 
 var (
@@ -233,6 +236,90 @@ func compactSQL(s string) string {
 func isCopyFromStdin(raw []byte) bool {
 	compact := compactSQL(stripLeadingSQLComments(string(raw)))
 	return strings.HasPrefix(compact, "COPY ") && strings.Contains(compact, " FROM STDIN")
+}
+
+// SchemasInPostgresSQL returns schema names from CREATE SCHEMA statements.
+// Rows inside COPY ... FROM stdin are ignored. Order follows the file.
+func SchemasInPostgresSQL(r io.Reader) ([]string, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	inCopy := false
+	var names []string
+	seen := map[string]struct{}{}
+	for sc.Scan() {
+		line := sc.Text()
+		if inCopy {
+			if strings.TrimRight(line, "\r") == `\.` {
+				inCopy = false
+			}
+			continue
+		}
+		trim := strings.TrimSpace(line)
+		if isCopyFromStdin([]byte(trim)) {
+			inCopy = true
+			continue
+		}
+		name, ok := createSchemaName(trim)
+		if !ok {
+			continue
+		}
+		if err := config.ValidateSchema(name); err != nil {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return names, nil
+}
+
+func createSchemaName(line string) (string, bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 3 {
+		return "", false
+	}
+	if !strings.EqualFold(fields[0], "CREATE") || !strings.EqualFold(fields[1], "SCHEMA") {
+		return "", false
+	}
+	i := 2
+	if i+2 < len(fields) && strings.EqualFold(fields[i], "IF") && strings.EqualFold(fields[i+1], "NOT") && strings.EqualFold(fields[i+2], "EXISTS") {
+		i += 3
+	}
+	if i >= len(fields) || strings.EqualFold(strings.TrimRight(fields[i], ";"), "AUTHORIZATION") {
+		return "", false
+	}
+	name := strings.TrimRight(fields[i], ";")
+	name = unquoteIdent(name)
+	if name == "" {
+		return "", false
+	}
+	return name, true
+}
+
+func unquoteIdent(s string) string {
+	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
+		return s
+	}
+	return strings.ReplaceAll(s[1:len(s)-1], `""`, `"`)
+}
+
+// SchemasInFile reads CREATE SCHEMA names from a plain SQL dump.
+// Custom-format dumps return no names; the caller clears the selected schema.
+func SchemasInFile(path string) ([]string, error) {
+	if IsCustomDump(path) {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return SchemasInPostgresSQL(f)
 }
 
 const (

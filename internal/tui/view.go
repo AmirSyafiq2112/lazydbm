@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/AmirSyafiq2112/lazydbm/internal/db"
 	"github.com/AmirSyafiq2112/lazydbm/internal/job"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -32,13 +33,17 @@ func (m model) View() string {
 	bodyH := max(1, m.height-lipgloss.Height(header)-lipgloss.Height(footer))
 	leftW, midW, rightW, topH, logH := paneSizes(m.width, bodyH)
 
-	left := m.viewListPane("servers", m.connLines(), m.connIdx, m.focus == paneServers, leftW, topH, "none")
-	mid := m.viewDBPane(midW, topH)
-	right := m.viewListPane("files", m.fileLines(), m.fileIdx, m.focus == paneFiles, rightW, topH, "none")
-	top := lipgloss.JoinHorizontal(lipgloss.Top, left, mid, right)
-	log := m.viewLogPane(m.width, logH)
-
-	body := lipgloss.JoinVertical(lipgloss.Left, top, log)
+	var body string
+	if m.logFull {
+		body = m.viewLogPane(m.width, bodyH)
+	} else {
+		left := m.viewListPane("servers", m.connLines(), m.connIdx, m.focus == paneServers, leftW, topH, "none")
+		mid := m.viewDBPane(midW, topH)
+		right := m.viewFilesPane(rightW, topH)
+		top := lipgloss.JoinHorizontal(lipgloss.Top, left, mid, right)
+		log := m.viewLogPane(m.width, logH)
+		body = lipgloss.JoinVertical(lipgloss.Left, top, log)
+	}
 	screen := clipTo(lipgloss.JoinVertical(lipgloss.Left, header, body, footer), m.width, m.height)
 
 	if m.overlay != overlayNone {
@@ -77,7 +82,11 @@ func (m model) viewFooter() string {
 		stStyle = lipgloss.NewStyle().Foreground(colRed)
 	}
 
-	help := fmt.Sprintf("enter connect  i import  e export  n new-db  a add  E edit  d delete  c clear:%s  p password  r refresh  q quit", clearLabel)
+	clearKey := "clear"
+	if m.schemaMode {
+		clearKey = "schema"
+	}
+	help := fmt.Sprintf("enter connect  i import  e export  n new-db  a add  E edit  d delete  c %s:%s  p password  r refresh  f log  / find  q quit", clearKey, clearLabel)
 	left := help
 	right := stStyle.Render("job:" + status)
 	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right)-2)
@@ -115,10 +124,24 @@ func (m model) connLines() []string {
 }
 
 func (m model) fileLines() []string {
-	if len(m.files) == 0 {
-		return nil
+	return m.visibleFiles()
+}
+
+func (m model) viewFilesPane(width, height int) string {
+	items := m.visibleFiles()
+	title := "files"
+	if m.fileSearch || m.fileQuery != "" {
+		mark := ""
+		if m.fileSearch {
+			mark = "_"
+		}
+		title = "files /" + m.fileQuery + mark
 	}
-	return append([]string(nil), m.files...)
+	empty := "none"
+	if m.fileQuery != "" && len(items) == 0 {
+		empty = "no match"
+	}
+	return m.viewListPane(title, items, m.fileIdx, m.focus == paneFiles, width, height, empty)
 }
 
 func (m model) viewDBPane(width, height int) string {
@@ -127,6 +150,13 @@ func (m model) viewDBPane(width, height int) string {
 	}
 	if !m.dbReady {
 		return m.viewListPane("databases", nil, 0, m.focus == paneDBs, width, height, "enter to connect")
+	}
+	if m.schemaMode {
+		title := "schemas"
+		if m.schemaDB != "" {
+			title = "schemas · " + m.schemaDB
+		}
+		return m.viewListPane(title, m.schemas, m.schemaIdx, m.focus == paneDBs, width, height, "no schemas")
 	}
 	return m.viewListPane("databases", m.databases, m.dbIdx, m.focus == paneDBs, width, height, "none")
 }
@@ -189,15 +219,33 @@ func (m model) viewLogPane(width, height int) string {
 	case job.StatusFail:
 		title = "log · failed"
 	}
+	if m.logFull {
+		title += " · full"
+	}
+	if pct := m.logScrollLabel(); pct != "" {
+		title += " · " + pct
+	}
 	border := paneBorder(m.focus == paneLogs)
 	innerW := max(1, width-border.GetHorizontalFrameSize())
 	innerH := max(1, height-border.GetVerticalFrameSize())
 	m.logVP.Width = innerW
 	m.logVP.Height = max(1, innerH-1)
 
-	head := lipgloss.NewStyle().Foreground(colAccent).Bold(true).Render(truncate(title, innerW))
+	hint := title
+	if m.logFull {
+		hint += "   j/k scroll · g/G top/bottom · esc close"
+	}
+	head := lipgloss.NewStyle().Foreground(colAccent).Bold(true).Render(truncate(hint, innerW))
 	content := lipgloss.JoinVertical(lipgloss.Left, head, m.logVP.View())
 	return border.Width(innerW).Height(innerH).MaxWidth(width).MaxHeight(height).Render(content)
+}
+
+func (m model) logScrollLabel() string {
+	total := m.logVP.TotalLineCount()
+	if total <= m.logVP.Height || m.logVP.Height <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d%%", int(m.logVP.ScrollPercent()*100))
 }
 
 func (m model) viewOverlay() string {
@@ -240,15 +288,36 @@ func (m model) viewOverlay() string {
 	case overlayConfirmImport:
 		c, _ := m.currentConn()
 		dbName, _ := m.currentDB()
+		if m.schemaDB != "" {
+			dbName = m.schemaDB
+		}
+		schema, _ := m.currentSchema()
+		clearNames := m.importSchemas
+		if schema != "" && len(clearNames) == 0 {
+			clearNames = []string{schema}
+		}
+		target := dbName
+		if schema != "" && len(m.importSchemas) <= 1 && len(clearNames) == 1 {
+			target = dbName + "." + clearNames[0]
+		}
 		f, _ := m.currentFile()
 		clear := "NO"
 		warn := ""
-		if m.clearDB {
+		if m.clearDB && len(clearNames) > 0 && schema != "" {
+			if len(clearNames) == 1 {
+				clear = "YES — DROP SCHEMA " + clearNames[0]
+				warn = "\n" + lipgloss.NewStyle().Foreground(colRed).Render("this destroys all objects in schema "+clearNames[0])
+			} else {
+				clear = fmt.Sprintf("YES — DROP %d SCHEMAS\n  %s", len(clearNames), strings.Join(clearNames, "\n  "))
+				warn = "\n" + lipgloss.NewStyle().Foreground(colRed).Render("this destroys all objects in those schemas")
+			}
+			warn += "\n" + lipgloss.NewStyle().Foreground(colRed).Render("dependent objects in other schemas are dropped too")
+		} else if m.clearDB {
 			clear = "YES — DROP + CREATE"
 			warn = "\n" + lipgloss.NewStyle().Foreground(colRed).Render("this destroys all data in "+dbName)
 		}
 		return box.Render(strings.Join([]string{
-			bold("import into " + dbName + " on " + c.Short()),
+			bold("import into " + target + " on " + c.Short()),
 			"file:  " + f,
 			"clear: " + clear + warn,
 			"",
@@ -256,13 +325,28 @@ func (m model) viewOverlay() string {
 		}, "\n"))
 	case overlayExportPath:
 		dbName, _ := m.currentDB()
+		if m.schemaDB != "" {
+			dbName = m.schemaDB
+		}
+		title := "export " + dbName
+		hint := "enter export · esc cancel"
+		if m.exportSchema != "" {
+			title = "export " + dbName + "." + m.exportSchema
+			hint = "this schema only · enter export · esc cancel"
+		}
 		return box.Render(strings.Join([]string{
-			bold("export " + dbName),
+			bold(title),
 			"",
 			m.pathInput.View(),
 			"",
-			muted("enter export · esc cancel"),
+			muted(hint),
 		}, "\n"))
+	case overlayExportPreview:
+		dbName, _ := m.currentDB()
+		if m.schemaDB != "" {
+			dbName = m.schemaDB
+		}
+		return box.Render(m.exportPreviewText(dbName))
 	case overlayCreateDB:
 		c, _ := m.currentConn()
 		return box.Render(strings.Join([]string{
@@ -336,23 +420,84 @@ func (m model) viewConnForm() string {
 	return strings.Join(lines, "\n")
 }
 
+func (m model) exportPreviewText(dbName string) string {
+	plan := m.exportPlan
+	total := int64(0)
+	for _, s := range plan {
+		total += s.Bytes
+	}
+	limit := len(plan)
+	if m.height >= 24 && len(plan) > m.height-16 {
+		limit = m.height - 16
+		if limit < 6 {
+			limit = 6
+		}
+	}
+	shown := plan
+	extra := 0
+	if len(plan) > limit {
+		shown = plan[:limit]
+		extra = len(plan) - limit
+	}
+	nameWidth := 0
+	for _, s := range shown {
+		if len(s.Name) > nameWidth {
+			nameWidth = len(s.Name)
+		}
+	}
+	lines := []string{bold("export " + dbName + "." + m.exportSchema), ""}
+	if len(plan) <= 1 {
+		lines = append(lines, "no foreign keys point outside this schema", "")
+	} else {
+		lines = append(lines, "these schemas will be exported", "")
+	}
+	for _, s := range shown {
+		mark := "  "
+		if s.Name == m.exportSchema {
+			mark = "❯ "
+		}
+		lines = append(lines, fmt.Sprintf("%s%-*s  %s", mark, nameWidth, s.Name, db.FormatBytes(s.Bytes)))
+	}
+	if extra > 0 {
+		lines = append(lines, fmt.Sprintf("  … and %d more", extra))
+	}
+	label := "1 schema"
+	if len(plan) != 1 {
+		label = fmt.Sprintf("%d schemas", len(plan))
+	}
+	lines = append(lines,
+		"",
+		label+" · "+db.FormatBytes(total),
+		"",
+		m.pathInput.View(),
+		"",
+		muted("enter export · esc cancel"),
+	)
+	return strings.Join(lines, "\n")
+}
+
 func helpText(version string) string {
 	return strings.Join([]string{
 		bold("lazydbm " + version),
 		"lightweight postgres/mysql import & export",
 		"",
-		"tab / h l     servers → databases → files",
+		"tab / h l     servers → databases → files → log",
 		"j k / arrows  move in focused pane",
-		"enter         connect server / import file",
+		"f             full-screen log (j/k scroll, esc closes)",
+		"/             search files (files pane)",
+		"enter         connect server / list schemas / import file",
+		"backspace     back to databases from a schema list",
 		"i             import selected file into selected database",
-		"e             export selected database",
+		"e             export database, or schema after a size preview",
 		"n             create a database on the server if it is missing",
 		"a             add server",
 		"E             edit / save as server",
 		"d             delete saved server",
-		"c             toggle clear-db (import only)",
+		"c             toggle clear before import",
+		"              database list: drop that database",
+		"              schema list: drop schemas named in the file",
 		"p             set / save password",
-		"r             re-list databases and refresh files",
+		"r             refresh sql files and re-list databases",
 		"q             quit",
 		"ctrl+c        cancel job / quit",
 		"",

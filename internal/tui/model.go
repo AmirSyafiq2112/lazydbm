@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/AmirSyafiq2112/lazydbm/internal/config"
+	"github.com/AmirSyafiq2112/lazydbm/internal/db"
 	"github.com/AmirSyafiq2112/lazydbm/internal/discover"
 	"github.com/AmirSyafiq2112/lazydbm/internal/job"
 	"github.com/AmirSyafiq2112/lazydbm/internal/secret"
@@ -34,6 +35,7 @@ const (
 	overlaySavePassword
 	overlayConfirmImport
 	overlayExportPath
+	overlayExportPreview
 	overlayHelp
 	overlayNotice
 	overlayAdd
@@ -50,6 +52,7 @@ const (
 	pendingExport
 	pendingConnect
 	pendingCreateDB
+	pendingSchemas
 )
 
 type model struct {
@@ -77,9 +80,21 @@ type model struct {
 	dbLists   map[string][]string
 	dbErrors  map[string]string
 
+	schemaMode    bool
+	schemas       []string
+	schemaIdx     int
+	schemaDB      string
+	exportSchema  string
+	exportPlan    []db.SchemaStat
+	importSchemas []string
+
 	runner   *job.Runner
 	logVP    viewport.Model
 	stickLog bool
+	logFull  bool
+
+	fileQuery  string
+	fileSearch bool
 
 	overlay   overlay
 	notice    string
@@ -201,10 +216,78 @@ func (m model) currentConn() (config.Connection, bool) {
 }
 
 func (m model) currentFile() (string, bool) {
-	if m.fileIdx < 0 || m.fileIdx >= len(m.files) {
+	files := m.visibleFiles()
+	if m.fileIdx < 0 || m.fileIdx >= len(files) {
 		return "", false
 	}
-	return m.files[m.fileIdx], true
+	return files[m.fileIdx], true
+}
+
+func (m model) visibleFiles() []string {
+	if len(m.files) == 0 {
+		return nil
+	}
+	q := strings.ToLower(strings.TrimSpace(m.fileQuery))
+	if q == "" {
+		return append([]string(nil), m.files...)
+	}
+	var out []string
+	for _, f := range m.files {
+		if strings.Contains(strings.ToLower(f), q) {
+			out = append(out, f)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (m *model) selectFile(path string) {
+	m.fileIdx = 0
+	if path == "" {
+		m.clampFileIdx()
+		return
+	}
+	for i, f := range m.visibleFiles() {
+		if f == path {
+			m.fileIdx = i
+			return
+		}
+	}
+	m.clampFileIdx()
+}
+
+func (m *model) clampFileIdx() {
+	n := len(m.visibleFiles())
+	if n == 0 || m.fileIdx < 0 {
+		m.fileIdx = 0
+		return
+	}
+	if m.fileIdx >= n {
+		m.fileIdx = n - 1
+	}
+}
+
+func (m model) currentSchema() (string, bool) {
+	if !m.schemaMode || m.schemaIdx < 0 || m.schemaIdx >= len(m.schemas) {
+		return "", false
+	}
+	name := m.schemas[m.schemaIdx]
+	if err := config.ValidateSchema(name); err != nil {
+		return "", false
+	}
+	return name, true
+}
+
+func (m *model) clearSchemas() {
+	m.schemaMode = false
+	m.schemas = nil
+	m.schemaIdx = 0
+	m.schemaDB = ""
+	m.exportSchema = ""
+	m.exportPlan = nil
+	m.importSchemas = nil
 }
 
 func (m model) currentDB() (string, bool) {
@@ -291,6 +374,7 @@ func (m model) persistLastUsed(c config.Connection) model {
 }
 
 func (m *model) showDBsForCurrent() {
+	m.clearSchemas()
 	c, ok := m.currentConn()
 	if !ok {
 		m.databases = nil
