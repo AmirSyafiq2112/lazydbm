@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/AmirSyafiq2112/lazydbm/internal/config"
 )
@@ -290,6 +291,21 @@ func TestDumpFilesSkipsVendorAndDotDirs(t *testing.T) {
 	}
 	if len(files) != 2 {
 		t.Fatalf("files = %#v", files)
+	}
+	older := time.Now().Add(-2 * time.Hour)
+	newer := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, "root.sql"), older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(dir, "db", "app.dump"), newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	files, err = dumpFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 || files[0] != filepath.Join("db", "app.dump") || files[1] != "root.sql" {
+		t.Fatalf("newest first = %#v", files)
 	}
 }
 

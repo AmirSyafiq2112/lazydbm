@@ -322,6 +322,161 @@ func SchemasInFile(path string) ([]string, error) {
 	return SchemasInPostgresSQL(f)
 }
 
+// TablesInSQL returns tables named by CREATE TABLE statements.
+// Rows inside COPY ... FROM stdin are ignored.
+func TablesInSQL(r io.Reader) ([]TableRef, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	inCopy := false
+	var tables []TableRef
+	seen := map[string]struct{}{}
+	for sc.Scan() {
+		line := sc.Text()
+		if inCopy {
+			if strings.TrimRight(line, "\r") == `\.` {
+				inCopy = false
+			}
+			continue
+		}
+		trim := strings.TrimSpace(line)
+		if isCopyFromStdin([]byte(trim)) {
+			inCopy = true
+			continue
+		}
+		ref, ok := createTableRef(trim)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[ref.Label()]; exists {
+			continue
+		}
+		seen[ref.Label()] = struct{}{}
+		tables = append(tables, ref)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return tables, nil
+}
+
+// TablesInFile reads CREATE TABLE names from a plain SQL dump.
+func TablesInFile(path string) ([]TableRef, error) {
+	if IsCustomDump(path) {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return TablesInSQL(f)
+}
+
+func createTableRef(line string) (TableRef, bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 3 || !strings.EqualFold(fields[0], "CREATE") {
+		return TableRef{}, false
+	}
+	i := 1
+	for i < len(fields) {
+		word := strings.ToUpper(strings.TrimRight(fields[i], ";"))
+		switch word {
+		case "UNLOGGED", "TEMP", "TEMPORARY", "GLOBAL", "LOCAL":
+			i++
+			continue
+		}
+		break
+	}
+	if i >= len(fields) || !strings.EqualFold(strings.TrimRight(fields[i], ";"), "TABLE") {
+		return TableRef{}, false
+	}
+	i++
+	if i+2 < len(fields) && strings.EqualFold(fields[i], "IF") && strings.EqualFold(fields[i+1], "NOT") && strings.EqualFold(fields[i+2], "EXISTS") {
+		i += 3
+	}
+	if i >= len(fields) {
+		return TableRef{}, false
+	}
+	raw := strings.TrimRight(fields[i], ";(")
+	schema, name, ok := splitQualified(raw)
+	if !ok || config.ValidateTable(name) != nil {
+		return TableRef{}, false
+	}
+	if schema != "" && config.ValidateSchema(schema) != nil {
+		return TableRef{}, false
+	}
+	return TableRef{Schema: schema, Name: name}, true
+}
+
+func splitQualified(s string) (schema, name string, ok bool) {
+	parts, ok := splitIdents(s)
+	if !ok {
+		return "", "", false
+	}
+	switch len(parts) {
+	case 1:
+		return "", parts[0], parts[0] != ""
+	case 2:
+		return parts[0], parts[1], parts[0] != "" && parts[1] != ""
+	default:
+		return "", "", false
+	}
+}
+
+func splitIdents(s string) ([]string, bool) {
+	var out []string
+	for i := 0; i < len(s); {
+		if s[i] == '.' {
+			i++
+			continue
+		}
+		ident, next, ok := readIdent(s, i)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, ident)
+		i = next
+		if i < len(s) && s[i] != '.' {
+			return nil, false
+		}
+	}
+	return out, len(out) > 0
+}
+
+func readIdent(s string, i int) (string, int, bool) {
+	if i >= len(s) {
+		return "", i, false
+	}
+	switch s[i] {
+	case '"', '`':
+		quote := s[i]
+		j := i + 1
+		var b strings.Builder
+		for j < len(s) {
+			if s[j] == quote {
+				if j+1 < len(s) && s[j+1] == quote {
+					b.WriteByte(quote)
+					j += 2
+					continue
+				}
+				return b.String(), j + 1, b.Len() > 0
+			}
+			b.WriteByte(s[j])
+			j++
+		}
+		return "", i, false
+	default:
+		j := i
+		for j < len(s) && s[j] != '.' {
+			j++
+		}
+		if j == i {
+			return "", i, false
+		}
+		return s[i:j], j, true
+	}
+}
+
 const (
 	stNormal = iota
 	stSQuote

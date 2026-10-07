@@ -36,6 +36,7 @@ const (
 	overlayConfirmImport
 	overlayExportPath
 	overlayExportPreview
+	overlayProtectedImport
 	overlayHelp
 	overlayNotice
 	overlayAdd
@@ -53,6 +54,7 @@ const (
 	pendingConnect
 	pendingCreateDB
 	pendingSchemas
+	pendingTables
 )
 
 type model struct {
@@ -86,7 +88,18 @@ type model struct {
 	schemaDB      string
 	exportSchema  string
 	exportPlan    []db.SchemaStat
+	exportTables  []db.TableStat
 	importSchemas []string
+	importTables  []db.TableRef
+
+	tableMode   bool
+	tables      []string
+	tableIdx    int
+	tableSchema string
+	tableDB     string
+	tableQuery  string
+	tableSearch bool
+	guardErr    string
 
 	runner   *job.Runner
 	logVP    viewport.Model
@@ -95,6 +108,9 @@ type model struct {
 
 	fileQuery  string
 	fileSearch bool
+
+	dbQuery  string
+	dbSearch bool
 
 	overlay   overlay
 	notice    string
@@ -270,17 +286,72 @@ func (m *model) clampFileIdx() {
 }
 
 func (m model) currentSchema() (string, bool) {
-	if !m.schemaMode || m.schemaIdx < 0 || m.schemaIdx >= len(m.schemas) {
+	if !m.schemaMode {
 		return "", false
 	}
-	name := m.schemas[m.schemaIdx]
+	names := m.visibleSchemas()
+	if m.schemaIdx < 0 || m.schemaIdx >= len(names) {
+		return "", false
+	}
+	name := names[m.schemaIdx]
 	if err := config.ValidateSchema(name); err != nil {
 		return "", false
 	}
 	return name, true
 }
 
+func (m model) visibleTables() []string {
+	if len(m.tables) == 0 {
+		return nil
+	}
+	q := strings.ToLower(strings.TrimSpace(m.tableQuery))
+	if q == "" {
+		return append([]string(nil), m.tables...)
+	}
+	var out []string
+	for _, name := range m.tables {
+		if strings.Contains(strings.ToLower(name), q) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func (m model) currentTable() (string, bool) {
+	if !m.tableMode {
+		return "", false
+	}
+	items := m.visibleTables()
+	if m.tableIdx < 0 || m.tableIdx >= len(items) {
+		return "", false
+	}
+	name := items[m.tableIdx]
+	if err := config.ValidateTable(name); err != nil {
+		return "", false
+	}
+	return name, true
+}
+
+func (m *model) clearTables() {
+	m.tableMode = false
+	m.tables = nil
+	m.tableIdx = 0
+	m.tableSchema = ""
+	m.tableDB = ""
+	m.tableQuery = ""
+	m.tableSearch = false
+	m.exportTables = nil
+	m.importTables = nil
+}
+
+func (m *model) clearDBSearch() {
+	m.dbSearch = false
+	m.dbQuery = ""
+}
+
 func (m *model) clearSchemas() {
+	m.clearTables()
+	m.clearDBSearch()
 	m.schemaMode = false
 	m.schemas = nil
 	m.schemaIdx = 0
@@ -290,14 +361,68 @@ func (m *model) clearSchemas() {
 	m.importSchemas = nil
 }
 
+func (m model) databaseLines() []string {
+	c, _ := m.currentConn()
+	if i := indexByID(m.conns, c.ID()); i >= 0 {
+		c = m.conns[i]
+	}
+	names := m.visibleDatabases()
+	out := make([]string, len(names))
+	for i, name := range names {
+		out[i] = name
+		if c.Protects(name) {
+			out[i] = name + "  protected"
+		}
+	}
+	return out
+}
+
+func (m model) visibleDatabases() []string {
+	return filterNames(m.databases, m.dbQuery)
+}
+
+func (m model) visibleSchemas() []string {
+	return filterNames(m.schemas, m.dbQuery)
+}
+
+func filterNames(names []string, query string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return append([]string(nil), names...)
+	}
+	var out []string
+	for _, name := range names {
+		if strings.Contains(strings.ToLower(name), q) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 func (m model) currentDB() (string, bool) {
 	if !m.dbReady || m.dbErr != "" {
 		return "", false
 	}
-	if m.dbIdx < 0 || m.dbIdx >= len(m.databases) {
+	if m.tableMode && m.tableDB != "" {
+		if err := config.ValidateDatabase(m.tableDB); err != nil {
+			return "", false
+		}
+		return m.tableDB, true
+	}
+	if m.schemaMode && m.schemaDB != "" {
+		if err := config.ValidateDatabase(m.schemaDB); err != nil {
+			return "", false
+		}
+		return m.schemaDB, true
+	}
+	names := m.visibleDatabases()
+	if m.dbIdx < 0 || m.dbIdx >= len(names) {
 		return "", false
 	}
-	name := m.databases[m.dbIdx]
+	name := names[m.dbIdx]
 	if err := config.ValidateDatabase(name); err != nil {
 		return "", false
 	}

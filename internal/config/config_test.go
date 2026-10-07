@@ -333,3 +333,26 @@ func TestPathHomeFallback(t *testing.T) {
 		t.Fatalf("path = %q", path)
 	}
 }
+
+func TestProtectedDatabases(t *testing.T) {
+	c := Connection{Engine: EnginePostgres, Host: "127.0.0.1", Port: 5432, User: "app", Source: SourceSaved}
+	c.SetProtected("epbt", true)
+	c.SetProtected("bad/name", true)
+	if !c.Protects("epbt") || c.Protects("bad/name") {
+		t.Fatalf("protected = %#v", c.Protected)
+	}
+	var f File
+	f.Upsert(c)
+	plain := c
+	plain.Protected = nil
+	plain.Name = "renamed"
+	f.Upsert(plain)
+	if !f.Connections[0].Protects("epbt") || f.Connections[0].Name != "renamed" {
+		t.Fatalf("upsert = %#v", f.Connections[0])
+	}
+	c.SetProtected("epbt", false)
+	f.Upsert(c)
+	if f.Connections[0].Protects("epbt") {
+		t.Fatal("protected mark should clear")
+	}
+}

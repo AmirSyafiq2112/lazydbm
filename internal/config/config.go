@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -18,15 +19,16 @@ const (
 )
 
 type Connection struct {
-	Name         string `yaml:"name"`
-	Engine       Engine `yaml:"engine"`
-	Host         string `yaml:"host"`
-	Port         int    `yaml:"port"`
-	User         string `yaml:"user"`
-	Database     string `yaml:"database,omitempty"`
-	LastDatabase string `yaml:"last_used_db,omitempty"`
-	Source       string `yaml:"source,omitempty"`
-	NoPassword   bool   `yaml:"no_password,omitempty"`
+	Name         string   `yaml:"name"`
+	Engine       Engine   `yaml:"engine"`
+	Host         string   `yaml:"host"`
+	Port         int      `yaml:"port"`
+	User         string   `yaml:"user"`
+	Database     string   `yaml:"database,omitempty"`
+	LastDatabase string   `yaml:"last_used_db,omitempty"`
+	Source       string   `yaml:"source,omitempty"`
+	NoPassword   bool     `yaml:"no_password,omitempty"`
+	Protected    []string `yaml:"protected,omitempty"`
 }
 
 func (c Connection) ID() string {
@@ -87,6 +89,40 @@ func ValidateSchema(name string) error {
 		return fmt.Errorf("invalid schema name")
 	}
 	return nil
+}
+
+func ValidateTable(name string) error {
+	if err := validateName(name, "table"); err != nil {
+		return err
+	}
+	if strings.ContainsAny(name, "*?[") {
+		return fmt.Errorf("invalid table name")
+	}
+	return nil
+}
+
+func (c Connection) Protects(database string) bool {
+	for _, name := range c.Protected {
+		if name == database {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Connection) SetProtected(database string, on bool) {
+	next := make([]string, 0, len(c.Protected)+1)
+	for _, name := range c.Protected {
+		if name == database || ValidateDatabase(name) != nil {
+			continue
+		}
+		next = append(next, name)
+	}
+	if on && ValidateDatabase(database) == nil {
+		next = append(next, database)
+	}
+	sort.Strings(next)
+	c.Protected = next
 }
 
 func validateName(name, kind string) error {
@@ -175,6 +211,7 @@ func normalizeFile(f File) File {
 		if c.LastDatabase != "" && ValidateDatabase(c.LastDatabase) != nil {
 			c.LastDatabase = ""
 		}
+		c.Protected = cleanProtected(c.Protected)
 		if err := c.ValidateFields(); err != nil {
 			continue
 		}
@@ -185,6 +222,9 @@ func normalizeFile(f File) File {
 			}
 			if c.LastDatabase != "" {
 				keep[idx].LastDatabase = c.LastDatabase
+			}
+			if len(c.Protected) > 0 {
+				keep[idx].Protected = unionProtected(keep[idx].Protected, c.Protected)
 			}
 			if c.Source != "" {
 				keep[idx].Source = c.Source
@@ -247,6 +287,9 @@ func (f *File) Upsert(c Connection) {
 			if c.LastDatabase != "" {
 				existing.LastDatabase = c.LastDatabase
 			}
+			if c.Protected != nil {
+				existing.Protected = append([]string(nil), c.Protected...)
+			}
 			existing.NoPassword = c.NoPassword
 			existing.Database = ""
 			f.Connections[i] = existing
@@ -269,6 +312,30 @@ func (f *File) Remove(id string) bool {
 		return true
 	}
 	return false
+}
+
+func cleanProtected(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if ValidateDatabase(name) != nil {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func unionProtected(a, b []string) []string {
+	return cleanProtected(append(append([]string{}, a...), b...))
 }
 
 func NormalizeEngine(s string) (Engine, bool) {

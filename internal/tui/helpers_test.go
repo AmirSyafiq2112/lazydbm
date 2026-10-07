@@ -27,6 +27,7 @@ func sampleConn() config.Connection {
 func testModel(t *testing.T) model {
 	t.Helper()
 	prevMissing, prevTest, prevList, prevSchemas, prevEnsure, prevPreview, prevDump := missingTools, testConn, listDBs, listSchemas, ensureDB, previewSchemas, dumpSchemas
+	prevListTables, prevPreviewTables, prevDumpTables := listTables, previewTables, dumpTables
 	missingTools = func(config.Connection, string, bool, bool) []string { return nil }
 	testConn = func(context.Context, config.Connection, string, db.LogFunc) error { return nil }
 	listDBs = func(context.Context, config.Connection, string, db.LogFunc) ([]string, error) {
@@ -40,8 +41,16 @@ func testModel(t *testing.T) model {
 		return []db.SchemaStat{{Name: schema, Bytes: 4096}}, nil
 	}
 	dumpSchemas = func(string) ([]string, error) { return nil, nil }
+	listTables = func(context.Context, config.Connection, string, string, db.LogFunc) ([]string, error) {
+		return []string{"orders", "items"}, nil
+	}
+	previewTables = func(_ context.Context, _ config.Connection, _, schema, table string, _ db.LogFunc) ([]db.TableStat, error) {
+		return []db.TableStat{{Schema: schema, Name: table, Bytes: 4096}}, nil
+	}
+	dumpTables = func(string) ([]db.TableRef, error) { return nil, nil }
 	t.Cleanup(func() {
 		missingTools, testConn, listDBs, listSchemas, ensureDB, previewSchemas, dumpSchemas = prevMissing, prevTest, prevList, prevSchemas, prevEnsure, prevPreview, prevDump
+		listTables, previewTables, dumpTables = prevListTables, prevPreviewTables, prevDumpTables
 	})
 	m := newModel("/tmp/app", "test")
 	m.store = secret.NewMemory()
@@ -1160,6 +1169,142 @@ func TestClearSchemasFromDump(t *testing.T) {
 	}
 }
 
+func TestTableListExportAndClear(t *testing.T) {
+	m := testModel(t)
+	m.envPW[sampleConn().ID()] = "pw"
+	m.focus = paneDBs
+
+	tm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	if !m.tableMode || m.tableSchema != "public" || m.tableDB != "epbt" {
+		t.Fatalf("tables mode=%v schema=%q db=%q", m.tableMode, m.tableSchema, m.tableDB)
+	}
+	if !strings.Contains(m.View(), "tables · epbt.public") || !strings.Contains(m.View(), "orders") {
+		t.Fatal(m.View())
+	}
+
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = asModel(t, tm)
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	m = asModel(t, tm)
+	if table, _ := m.currentTable(); table != "items" {
+		t.Fatalf("filtered table = %q", table)
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	m = asModel(t, tm)
+	if m.overlay != overlayExportPreview || !strings.Contains(m.viewOverlay(), "public.items") || !strings.Contains(m.viewOverlay(), "4.0 KB") {
+		t.Fatal(m.viewOverlay())
+	}
+	var got []string
+	orig := exportTableSet
+	t.Cleanup(func() { exportTableSet = orig })
+	exportTableSet = func(_ context.Context, c config.Connection, _ string, tables []db.TableStat, _ string, _ db.LogFunc) error {
+		for _, table := range tables {
+			got = append(got, c.Database+"."+table.Label())
+		}
+		return nil
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	if _, err := job.Wait(m.runner, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "epbt.public.items" {
+		t.Fatalf("exported %v", got)
+	}
+
+	m.clearDB = true
+	dumpTables = func(string) ([]db.TableRef, error) {
+		return []db.TableRef{{Schema: "public", Name: "items"}, {Schema: "public", Name: "orders"}}, nil
+	}
+	tm, _ = m.beginImport()
+	m = asModel(t, tm)
+	overlay := m.viewOverlay()
+	if !strings.Contains(overlay, "DROP 2 TABLES") || !strings.Contains(overlay, "public.items") || !strings.Contains(overlay, "public.orders") {
+		t.Fatalf("overlay = %s", overlay)
+	}
+	var dropped string
+	origR := resetTables
+	t.Cleanup(func() { resetTables = origR })
+	resetTables = func(_ context.Context, _ config.Connection, _ string, tables []db.TableRef, _ db.LogFunc) error {
+		for _, table := range tables {
+			if dropped != "" {
+				dropped += ","
+			}
+			dropped += table.Label()
+		}
+		return nil
+	}
+	origI := importDB
+	t.Cleanup(func() { importDB = origI })
+	importDB = func(context.Context, config.Connection, string, string, bool, db.LogFunc) error { return nil }
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	if _, err := job.Wait(m.runner, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if dropped != "public.items,public.orders" {
+		t.Fatalf("dropped %q", dropped)
+	}
+
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	m = asModel(t, tm)
+	if m.tableMode || !m.schemaMode {
+		t.Fatalf("backspace tableMode=%v schemaMode=%v", m.tableMode, m.schemaMode)
+	}
+}
+
+func TestProtectedImport(t *testing.T) {
+	m := testModel(t)
+	m.envPW[sampleConn().ID()] = "pw"
+	m.conns[0].Source = config.SourceSaved
+	m.focus = paneDBs
+
+	tm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	m = asModel(t, tm)
+	if !m.conns[0].Protects("epbt") || !strings.Contains(m.View(), "epbt  protected") {
+		t.Fatalf("protected = %#v\n%s", m.conns[0].Protected, m.View())
+	}
+
+	var imported bool
+	origI := importDB
+	t.Cleanup(func() { importDB = origI })
+	importDB = func(context.Context, config.Connection, string, string, bool, db.LogFunc) error {
+		imported = true
+		return nil
+	}
+	tm, _ = m.beginImport()
+	m = asModel(t, tm)
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	if m.overlay != overlayProtectedImport || imported {
+		t.Fatalf("overlay=%d imported=%v", m.overlay, imported)
+	}
+	if !strings.Contains(m.viewOverlay(), "protected database") || !strings.Contains(m.viewOverlay(), "epbt") {
+		t.Fatal(m.viewOverlay())
+	}
+	m.dbInput.SetValue("local")
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	if m.overlay != overlayProtectedImport || imported || m.guardErr == "" {
+		t.Fatalf("wrong name should stay, overlay=%d err=%q", m.overlay, m.guardErr)
+	}
+	m.dbInput.SetValue("epbt")
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	if _, err := job.Wait(m.runner, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if !imported {
+		t.Fatal("matching name should import")
+	}
+}
+
 func TestRefreshSQLFiles(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "new.sql"), []byte("-- new\n"), 0o644); err != nil {
@@ -1336,6 +1481,97 @@ func TestFileSearchFiltersSelection(t *testing.T) {
 	m = asModel(t, tm)
 	if m.fileSearch || m.fileQuery != "" || len(m.fileLines()) != 3 {
 		t.Fatalf("esc should clear search: %+v lines=%#v", m.fileQuery, m.fileLines())
+	}
+}
+
+func TestDatabaseAndSchemaSearch(t *testing.T) {
+	m := testModel(t)
+	m.envPW[sampleConn().ID()] = "pw"
+	m.focus = paneDBs
+	tm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = asModel(t, tm)
+	for _, r := range []rune{'e', 'p'} {
+		tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = asModel(t, tm)
+	}
+	if db, ok := m.currentDB(); !ok || db != "epbt" {
+		t.Fatalf("filtered db = %q ok=%v", db, ok)
+	}
+	if !strings.Contains(m.View(), "databases /ep") {
+		t.Fatal(m.View())
+	}
+	if strings.Contains(m.View(), "postgres") {
+		t.Fatal("unmatched database should be hidden")
+	}
+
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = asModel(t, tm)
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	if !m.schemaMode {
+		t.Fatal("enter should list schemas")
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = asModel(t, tm)
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = asModel(t, tm)
+	if schema, ok := m.currentSchema(); !ok || schema != "app" {
+		t.Fatalf("filtered schema = %q ok=%v", schema, ok)
+	}
+	if db, ok := m.currentDB(); !ok || db != "epbt" {
+		t.Fatalf("schema search dropped the open database: %q ok=%v", db, ok)
+	}
+	if strings.Contains(m.View(), "public") {
+		t.Fatal(m.View())
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	if m.dbSearch || m.tableMode || m.dbQuery != "a" {
+		t.Fatalf("enter should keep the filter: search=%v table=%v query=%q", m.dbSearch, m.tableMode, m.dbQuery)
+	}
+	if schema, ok := m.currentSchema(); !ok || schema != "app" {
+		t.Fatalf("filtered schema after confirm = %q ok=%v", schema, ok)
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, tm)
+	if !m.tableMode || m.tableSchema != "app" || m.tableDB != "epbt" {
+		t.Fatalf("tables mode=%v schema=%q db=%q", m.tableMode, m.tableSchema, m.tableDB)
+	}
+}
+
+func TestFileListShowsModifiedTime(t *testing.T) {
+	dir := t.TempDir()
+	older := time.Now().Add(-2 * time.Hour).Truncate(time.Minute)
+	newer := time.Now().Add(-time.Minute).Truncate(time.Minute)
+	if err := os.WriteFile(filepath.Join(dir, "old.sql"), []byte("-- old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "new.sql"), []byte("-- new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(dir, "old.sql"), older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(dir, "new.sql"), newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	files, err := discover.Files(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 || files[0] != "new.sql" || files[1] != "old.sql" {
+		t.Fatalf("newest first = %#v", files)
+	}
+	m := testModel(t)
+	m.cwd = dir
+	m.files = files
+	m.focus = paneFiles
+	view := m.View()
+	if !strings.Contains(view, "new.sql") || !strings.Contains(view, newer.Format("02 Jan 15:04")) {
+		t.Fatal(view)
+	}
+	if !strings.Contains(view, older.Format("02 Jan 15:04")) {
+		t.Fatal(view)
 	}
 }
 

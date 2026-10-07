@@ -185,6 +185,32 @@ func TestSchemasInPostgresSQL(t *testing.T) {
 	}
 }
 
+func TestTablesInSQL(t *testing.T) {
+	in := strings.Join([]string{
+		"CREATE TABLE mswn.orders (",
+		"CREATE TABLE IF NOT EXISTS public.items (",
+		`CREATE TABLE "spss"."users" (`,
+		"CREATE UNLOGGED TABLE logs (",
+		"CREATE TABLE `shop` (",
+		"COPY mswn.orders (id) FROM stdin;",
+		"CREATE TABLE inside_copy (",
+		`\.`,
+		"CREATE TEMP TABLE scratch (",
+		"",
+	}, "\n")
+	tables, err := TablesInSQL(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var labels []string
+	for _, table := range tables {
+		labels = append(labels, table.Label())
+	}
+	if strings.Join(labels, ",") != "mswn.orders,public.items,spss.users,logs,shop,scratch" {
+		t.Fatalf("tables = %#v", labels)
+	}
+}
+
 func TestFilterEmptyDollarBody(t *testing.T) {
 	in := "SELECT $$$$ AS empty;\nALTER TABLE t OWNER TO x;\n"
 	got := filterSQL(t, in)

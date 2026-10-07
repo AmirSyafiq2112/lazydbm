@@ -202,8 +202,13 @@ func (m model) saveConnForm() (tea.Model, tea.Cmd) {
 	}
 	c.NoPassword = pw == ""
 
-	if old := m.connByID(oldID); old.LastDatabase != "" {
-		c.LastDatabase = old.LastDatabase
+	if old := m.connByID(oldID); old.LastDatabase != "" || len(old.Protected) > 0 {
+		if old.LastDatabase != "" {
+			c.LastDatabase = old.LastDatabase
+		}
+		if len(old.Protected) > 0 {
+			c.Protected = append([]string(nil), old.Protected...)
+		}
 	}
 
 	m.cfg.Upsert(c)

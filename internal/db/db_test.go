@@ -815,3 +815,48 @@ func TestTestConnectionPostgresAndMySQL(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestListAndExportTables(t *testing.T) {
+	rec := withFakeExec(t, nil)
+	rec.output = []string{"orders", "items"}
+	names, err := ListTables(context.Background(), pgConn(), "pw", "mswn", func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(names, ",") != "orders,items" {
+		t.Fatalf("names = %#v", names)
+	}
+	if !containsQuery(rec.calls[0].args, "pg_class") || !containsQuery(rec.calls[0].args, "'mswn'") {
+		t.Fatalf("args = %v", rec.calls[0].args)
+	}
+
+	rec = withFakeExec(t, nil)
+	rec.output = []string{"mswn|orders|4096", "spss|users|1048576"}
+	stats, err := PreviewTableExport(context.Background(), pgConn(), "pw", "mswn", "orders", func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 2 || stats[0].Label() != "mswn.orders" || stats[1].Label() != "spss.users" || stats[1].Bytes != 1048576 {
+		t.Fatalf("stats = %#v", stats)
+	}
+
+	rec = withFakeExec(t, nil)
+	dir := t.TempDir()
+	out := filepath.Join(dir, "tables.sql")
+	if err := ExportTables(context.Background(), pgConn(), "pw", stats, out, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	args := rec.calls[0].args
+	if rec.calls[0].name != "pg_dump" || !contains(args, `"mswn"."orders"`) || !contains(args, `"spss"."users"`) || !containsPrefix(args, "--file=") {
+		t.Fatalf("args = %v", args)
+	}
+
+	rec = withFakeExec(t, nil)
+	err = ResetTables(context.Background(), pgConn(), "pw", []TableRef{{Schema: "mswn", Name: "orders"}, {Schema: "spss", Name: "users"}}, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.calls[0].stdin, `DROP TABLE IF EXISTS "mswn"."orders" CASCADE;`) || !strings.Contains(rec.calls[0].stdin, `DROP TABLE IF EXISTS "spss"."users" CASCADE;`) {
+		t.Fatalf("stdin = %s", rec.calls[0].stdin)
+	}
+}
